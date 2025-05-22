@@ -1,38 +1,35 @@
 from flask import Flask, jsonify
-app = Flask(__name__)
+from flask_cors import CORS
 
+app = Flask(__name__)
+CORS(app)  # Enables CORS for all routes
+
+# ✅ Health route
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"})
 
-from flask import Flask, jsonify
-from flask_cors import CORS
-import os
-
-app = Flask(__name__)
-CORS(app)  # ✅ Enable CORS for all routes
-
-@app.route('/signals')
+# ✅ Example signal route (temporary test)
+@app.route("/get-signals", methods=["GET"])
 def get_signals():
-    return jsonify([
+    signals = [
         {
             "symbol": "RELIANCE",
-            "type": "Intraday",
-            "entry": 2845.50,
-            "stop_loss": 2832.00,
-            "target": 2865.00,
-            "strategy": "MACD + Supertrend"
+            "type": "Buy",
+            "price": 2850,
+            "strategy": "MACD + Supertrend",
+            "timeframe": "15min",
         },
         {
-            "symbol": "BANKNIFTY23000CE",
-            "type": "Options",
-            "entry": 245.00,
-            "stop_loss": 230.00,
-            "target": 275.00,
-            "strategy": "RSI + Volume Spike"
+            "symbol": "BANKNIFTY",
+            "type": "Sell",
+            "price": 48200,
+            "strategy": "Pivot Breakdown",
+            "timeframe": "5min",
         }
-    ])
+    ]
+    return jsonify({"signals": signals})
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+# ✅ Run if local (ignored by gunicorn in Render)
+if __name__ == "__main__":
+    app.run(debug=True)
