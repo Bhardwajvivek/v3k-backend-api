@@ -1,67 +1,63 @@
-
 from flask import Flask, jsonify
-from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 
 app = Flask(__name__)
-CORS(app)
 
-def check_macd_crossover(df):
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+def calculate_macd(data):
+    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
     signal = macd.ewm(span=9, adjust=False).mean()
-    return macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]
+    return macd, signal
 
-def check_supertrend(df, period=7, multiplier=3):
-    atr = df['High'].rolling(window=period).max() - df['Low'].rolling(window=period).min()
-    hl2 = (df['High'] + df['Low']) / 2
-    upperband = hl2 + multiplier * atr
-    lowerband = hl2 - multiplier * atr
-    return df['Close'].iloc[-1] > upperband.iloc[-1]
+def calculate_supertrend(data, period=7, multiplier=3):
+    hl2 = (data['High'] + data['Low']) / 2
+    atr = data['High'].rolling(period).max() - data['Low'].rolling(period).min()
+    upper_band = hl2 + (multiplier * atr)
+    lower_band = hl2 - (multiplier * atr)
 
-def scan_symbol(symbol):
-    try:
-        df = yf.download(symbol, interval="15m", period="2d", progress=False)
-        if df.empty or len(df) < 30:
-            return None
-
-        if check_macd_crossover(df):
-            return {
-                "symbol": symbol.replace(".NS", ""),
-                "type": "Buy",
-                "price": round(df['Close'].iloc[-1], 2),
-                "strategy": "MACD Crossover",
-                "timeframe": "15min"
-            }
-
-        if check_supertrend(df):
-            return {
-                "symbol": symbol.replace(".NS", ""),
-                "type": "Buy",
-                "price": round(df['Close'].iloc[-1], 2),
-                "strategy": "Supertrend Breakout",
-                "timeframe": "15min"
-            }
-
-        return None
-    except Exception as e:
-        return None
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({"status": "ok"})
+    supertrend = [True] * len(data)
+    for i in range(1, len(data)):
+        if data['Close'][i] > upper_band[i - 1]:
+            supertrend[i] = True
+        elif data['Close'][i] < lower_band[i - 1]:
+            supertrend[i] = False
+        else:
+            supertrend[i] = supertrend[i - 1]
+    return supertrend
 
 @app.route("/get-signals", methods=["GET"])
 def get_signals():
-    symbols = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+    symbols = ["RELIANCE.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "ICICIBANK.NS"]
     results = []
-    for sym in symbols:
-        result = scan_symbol(sym)
-        if result:
-            results.append(result)
+
+    for symbol in symbols:
+        df = yf.download(symbol, interval="1d", period="15d")
+        if df.empty or len(df) < 10:
+            continue
+
+        df["MACD"], df["Signal"] = calculate_macd(df)
+        df["Supertrend"] = calculate_supertrend(df)
+
+        if (
+            df["MACD"].iloc[-2] < df["Signal"].iloc[-2]
+            and df["MACD"].iloc[-1] > df["Signal"].iloc[-1]
+            and df["Supertrend"].iloc[-1] == True
+        ):
+            results.append({
+                "symbol": symbol.replace(".NS", ""),
+                "type": "Buy",
+                "price": round(df["Close"].iloc[-1], 2),
+                "strategy": "MACD + Supertrend",
+                "timeframe": "1d"
+            })
+
     return jsonify({"signals": results})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
     app.run(debug=True)
