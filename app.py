@@ -11,21 +11,41 @@ def calculate_macd(data):
     signal = macd.ewm(span=9, adjust=False).mean()
     return macd, signal
 
-def calculate_supertrend(data, period=7, multiplier=3):
-    hl2 = (data['High'] + data['Low']) / 2
-    atr = data['High'].rolling(period).max() - data['Low'].rolling(period).min()
-    upper_band = hl2 + (multiplier * atr)
-    lower_band = hl2 - (multiplier * atr)
+def calculate_supertrend(df, period=7, multiplier=3):
+    df = df.copy()
 
-    supertrend = [True] * len(data)
-    for i in range(1, len(data)):
-        if data['Close'][i] > upper_band[i - 1]:
-            supertrend[i] = True
-        elif data['Close'][i] < lower_band[i - 1]:
-            supertrend[i] = False
+    # Calculate ATR
+    df['H-L'] = df['High'] - df['Low']
+    df['H-PC'] = abs(df['High'] - df['Close'].shift())
+    df['L-PC'] = abs(df['Low'] - df['Close'].shift())
+    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(period).mean()
+
+    # Calculate upper and lower bands
+    hl2 = (df['High'] + df['Low']) / 2
+    df['UpperBand'] = hl2 + (multiplier * df['ATR'])
+    df['LowerBand'] = hl2 - (multiplier * df['ATR'])
+
+    # Initialize Supertrend
+    df['Supertrend'] = True
+    for i in range(1, len(df)):
+        curr_close = df['Close'].iloc[i]
+        prev_close = df['Close'].iloc[i - 1]
+        prev_supertrend = df['Supertrend'].iloc[i - 1]
+
+        if curr_close > df['UpperBand'].iloc[i - 1]:
+            df['Supertrend'].iloc[i] = True
+        elif curr_close < df['LowerBand'].iloc[i - 1]:
+            df['Supertrend'].iloc[i] = False
         else:
-            supertrend[i] = supertrend[i - 1]
-    return supertrend
+            df['Supertrend'].iloc[i] = prev_supertrend
+
+            if prev_supertrend and df['LowerBand'].iloc[i] < df['LowerBand'].iloc[i - 1]:
+                df['LowerBand'].iloc[i] = df['LowerBand'].iloc[i - 1]
+            if not prev_supertrend and df['UpperBand'].iloc[i] > df['UpperBand'].iloc[i - 1]:
+                df['UpperBand'].iloc[i] = df['UpperBand'].iloc[i - 1]
+
+    return df['Supertrend']
 
 @app.route("/get-signals", methods=["GET"])
 def get_signals():
