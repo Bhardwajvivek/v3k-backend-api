@@ -1,6 +1,5 @@
-flask
-flask-cors
-gunicorn
+Flask
 yfinance
 pandas
-numpy
+ta
+gunicorn
