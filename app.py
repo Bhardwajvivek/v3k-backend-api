@@ -6,90 +6,71 @@ import pandas as pd
 app = Flask(__name__)
 CORS(app)
 
-def calculate_supertrend(data, period=10, multiplier=3):
-    data = data.copy()
-    hl2 = (data['High'] + data['Low']) / 2
-    atr = data['High'].rolling(period).max() - data['Low'].rolling(period).min()
+def calculate_supertrend(df, period=10, multiplier=3):
+    df = df.copy()
+    df['ATR'] = df['High'].rolling(window=period).max() - df['Low'].rolling(window=period).min()
+    df['UpperBand'] = ((df['High'] + df['Low']) / 2) + multiplier * df['ATR']
+    df['LowerBand'] = ((df['High'] + df['Low']) / 2) - multiplier * df['ATR']
+    df['Supertrend'] = df['Close']
+    return df
 
-    upper_band = hl2 + (multiplier * atr)
-    lower_band = hl2 - (multiplier * atr)
+def calculate_macd(df):
+    df = df.copy()
+    df["EMA12"] = df["Close"].ewm(span=12, adjust=False).mean()
+    df["EMA26"] = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = df["EMA12"] - df["EMA26"]
+    df["SignalLine"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    return df
 
-    supertrend = [False] * len(data)
-    for i in range(1, len(data)):
-        try:
-            if data['Close'].iloc[i] > upper_band.iloc[i - 1]:
-                supertrend[i] = True
-            elif data['Close'].iloc[i] < lower_band.iloc[i - 1]:
-                supertrend[i] = False
-            else:
-                supertrend[i] = supertrend[i - 1]
-        except Exception:
-            supertrend[i] = False
+def scan_stock(symbol):
+    try:
+        data = yf.download(symbol, period="5d", interval="15m", progress=False)
+        if data.empty or len(data) < 35:
+            return None
 
-    data['Supertrend'] = supertrend
-    return data
+        data.reset_index(inplace=True)
+        data.columns = [col.capitalize() for col in data.columns]
 
-def calculate_macd(data):
-    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
+        data = calculate_macd(data)
+        data = calculate_supertrend(data)
 
-@app.route("/")
-def health_check():
-    return jsonify({"status": "ok"})
+        latest = data.iloc[-1]
+        previous = data.iloc[-2]
+
+        signal = None
+        if latest["MACD"] > latest["SignalLine"] and previous["MACD"] <= previous["SignalLine"]:
+            signal = {
+                "symbol": symbol,
+                "type": "Buy",
+                "price": round(latest["Close"], 2),
+                "strategy": "MACD Crossover",
+                "timeframe": "15min"
+            }
+        elif latest["MACD"] < latest["SignalLine"] and previous["MACD"] >= previous["SignalLine"]:
+            signal = {
+                "symbol": symbol,
+                "type": "Sell",
+                "price": round(latest["Close"], 2),
+                "strategy": "MACD Crossover",
+                "timeframe": "15min"
+            }
+        return signal
+    except Exception as e:
+        print(f"Error processing {symbol}: {e}")
+        return None
 
 @app.route("/get-signals")
 def get_signals():
-    try:
-        symbols = ["RELIANCE.NS", "BANKNIFTY.NS"]
-        signals = []
+    symbols = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+    all_signals = []
 
-        for symbol in symbols:
-            df = yf.download(symbol, period="5d", interval="15m")
-            if df.empty or 'Close' not in df.columns:
-                continue
+    for symbol in symbols:
+        signal = scan_stock(symbol)
+        if signal:
+            all_signals.append(signal)
 
-            df = calculate_supertrend(df)
-            macd, signal_line = calculate_macd(df)
-            df["MACD"] = macd
-            df["Signal_Line"] = signal_line
+    return jsonify({"signals": all_signals})
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            # Entry logic
-            if (
-                last["MACD"] > last["Signal_Line"]
-                and last["Supertrend"]
-                and prev["MACD"] <= prev["Signal_Line"]
-            ):
-                signals.append({
-                    "symbol": symbol.replace(".NS", ""),
-                    "type": "Buy",
-                    "price": round(last["Close"], 2),
-                    "strategy": "MACD + Supertrend",
-                    "timeframe": "15min"
-                })
-            elif (
-                last["MACD"] < last["Signal_Line"]
-                and not last["Supertrend"]
-                and prev["MACD"] >= prev["Signal_Line"]
-            ):
-                signals.append({
-                    "symbol": symbol.replace(".NS", ""),
-                    "type": "Sell",
-                    "price": round(last["Close"], 2),
-                    "strategy": "MACD + Supertrend",
-                    "timeframe": "15min"
-                })
-
-        return jsonify({"signals": signals})
-
-    except Exception as e:
-        print("Error in /get-signals:", str(e))
-        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route("/")
+def home():
+    return jsonify({"status": "ok"})
