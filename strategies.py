@@ -14,18 +14,22 @@ TIMEFRAMES = {
 }
 
 def calculate_indicators(df):
-    df['EMA_8'] = EMAIndicator(df['Close'], window=8).ema_indicator()
-    df['EMA_20'] = EMAIndicator(df['Close'], window=20).ema_indicator()
-    df['EMA_200'] = EMAIndicator(df['Close'], window=200).ema_indicator()
+    close = df['Close'].squeeze()
+    high = df['High'].squeeze()
+    low = df['Low'].squeeze()
 
-    macd = MACD(close=df['Close'])
+    df['EMA_8'] = EMAIndicator(close, window=8).ema_indicator()
+    df['EMA_20'] = EMAIndicator(close, window=20).ema_indicator()
+    df['EMA_200'] = EMAIndicator(close, window=200).ema_indicator()
+
+    macd = MACD(close=close)
     df['MACD'] = macd.macd()
     df['MACD_SIGNAL'] = macd.macd_signal()
 
-    rsi = RSIIndicator(close=df['Close'], window=14)
+    rsi = RSIIndicator(close=close)
     df['RSI'] = rsi.rsi()
 
-    atr = AverageTrueRange(df['High'], df['Low'], df['Close'])
+    atr = AverageTrueRange(high, low, close)
     df['ATR'] = atr.average_true_range()
 
     return df
