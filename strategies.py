@@ -43,23 +43,28 @@ def detect_signals(df, symbol, tf):
     latest = df.iloc[-1]
     previous = df.iloc[-2]
 
-    if previous['MACD'] < previous['MACD_SIGNAL'] and latest['MACD'] > latest['MACD_SIGNAL']:
-        signals.append('MACD Bullish Crossover')
+    try:
+        if previous['MACD'].item() < previous['MACD_SIGNAL'].item() and latest['MACD'].item() > latest['MACD_SIGNAL'].item():
+            signals.append('MACD Bullish Crossover')
 
-    if latest['RSI'] < 30:
-        signals.append('RSI Oversold')
-    elif latest['RSI'] > 70:
-        signals.append('RSI Overbought')
+        if latest['RSI'].item() < 30:
+            signals.append('RSI Oversold')
+        elif latest['RSI'].item() > 70:
+            signals.append('RSI Overbought')
 
-    if latest['Close'] > latest['EMA_8'] > latest['EMA_20']:
-        signals.append('Supertrend Buy Signal')
+        if latest['Close'].item() > latest['EMA_8'].item() > latest['EMA_20'].item():
+            signals.append('Supertrend Buy Signal')
 
-    recent_high = df['High'][-2:].max()
-    if latest['Close'] > recent_high:
-        signals.append('Pivot Breakout')
+        recent_high = df['High'].iloc[-2:].max()
+        if latest['Close'].item() > recent_high:
+            signals.append('Pivot Breakout')
 
-    if latest['EMA_8'] > latest['EMA_20'] > latest['EMA_200']:
-        signals.append('MA Crossover Bullish (8 > 20 > 200)')
+        if latest['EMA_8'].item() > latest['EMA_20'].item() > latest['EMA_200'].item():
+            signals.append('MA Crossover Bullish (8 > 20 > 200)')
+
+    except Exception as e:
+        print(f"[{symbol}][{tf}] ERROR in signal detection: {e}")
+        return signals
 
     if signals:
         print(f"[{symbol}][{tf}] Signals Found: {signals}")
