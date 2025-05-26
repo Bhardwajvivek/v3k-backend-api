@@ -33,6 +33,7 @@ def calculate_indicators(df):
 def detect_signals(df, symbol, tf):
     signals = []
     if df.empty or len(df) < 200:
+        print(f"[{symbol}][{tf}] Not enough data: {len(df)} rows")
         return signals
 
     latest = df.iloc[-1]
@@ -56,11 +57,16 @@ def detect_signals(df, symbol, tf):
     if latest['EMA_8'] > latest['EMA_20'] > latest['EMA_200']:
         signals.append('MA Crossover Bullish (8 > 20 > 200)')
 
+    if signals:
+        print(f"[{symbol}][{tf}] Signals Found: {signals}")
+    else:
+        print(f"[{symbol}][{tf}] No signals.")
     return signals
 
 def fetch_and_analyze(symbol, interval):
     period = '60d' if interval in ['5m', '15m'] else '365d'
     try:
+        print(f"Fetching {symbol} @ {interval}")
         df = yf.download(symbol, interval=interval, period=period, progress=False)
         df = calculate_indicators(df)
         return detect_signals(df, symbol, interval)
