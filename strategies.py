@@ -1,100 +1,118 @@
-import pandas as pd
-import yfinance as yf
-from ta.trend import MACD, EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
-from datetime import datetime
 
-TIMEFRAMES = {
-    '5m': '5m',
-    '15m': '15m',
-    '1d': '1d',
-    '1wk': '1wk',
-    '1mo': '1mo'
-}
+import yfinance as yf
+import pandas as pd
+import numpy as np
 
 def calculate_indicators(df):
-    close = df['Close'].squeeze()
-    high = df['High'].squeeze()
-    low = df['Low'].squeeze()
+    # EMA
+    df['EMA_8'] = df['Close'].ewm(span=8, adjust=False).mean()
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
 
-    df['EMA_8'] = EMAIndicator(close, window=8).ema_indicator()
-    df['EMA_20'] = EMAIndicator(close, window=20).ema_indicator()
-    df['EMA_200'] = EMAIndicator(close, window=200).ema_indicator()
+    # MACD
+    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    macd = MACD(close=close)
-    df['MACD'] = macd.macd()
-    df['MACD_SIGNAL'] = macd.macd_signal()
+    # RSI
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
 
-    rsi = RSIIndicator(close=close)
-    df['RSI'] = rsi.rsi()
+    # ATR (for SL)
+    df['H-L'] = df['High'] - df['Low']
+    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
+    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
+    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=14).mean()
 
-    atr = AverageTrueRange(high, low, close)
-    df['ATR'] = atr.average_true_range()
-
+    # Supertrend
+    factor = 3
+    hl2 = (df['High'] + df['Low']) / 2
+    df['UpperBand'] = hl2 + (factor * df['ATR'])
+    df['LowerBand'] = hl2 - (factor * df['ATR'])
+    df['Supertrend'] = np.nan
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['UpperBand'].iloc[i-1]:
+            df['Supertrend'].iloc[i] = 'buy'
+        elif df['Close'].iloc[i] < df['LowerBand'].iloc[i-1]:
+            df['Supertrend'].iloc[i] = 'sell'
+        else:
+            df['Supertrend'].iloc[i] = df['Supertrend'].iloc[i-1]
     return df
 
-def detect_signals(df, symbol, tf):
-    signals = []
-    if df.empty or len(df) < 200:
-        print(f"[{symbol}][{tf}] Not enough data: {len(df)} rows")
-        return signals
+def get_pivot_levels(df):
+    last_row = df.iloc[-2]
+    pp = (last_row['High'] + last_row['Low'] + last_row['Close']) / 3
+    r1 = (2 * pp) - last_row['Low']
+    s1 = (2 * pp) - last_row['High']
+    return pp, r1, s1
 
-    latest = df.iloc[[-1]].copy()
-    previous = df.iloc[[-2]].copy()
+def volume_spike(df):
+    avg_vol = df['Volume'].rolling(window=10).mean().iloc[-2]
+    latest_vol = df['Volume'].iloc[-1]
+    return latest_vol > 1.5 * avg_vol
 
+def generate_signal(symbol, interval, period):
     try:
-        if float(previous['MACD'].iloc[0]) < float(previous['MACD_SIGNAL'].iloc[0]) and float(latest['MACD'].iloc[0]) > float(latest['MACD_SIGNAL'].iloc[0]):
-            signals.append('MACD Bullish Crossover')
-
-        if float(latest['RSI'].iloc[0]) < 30:
-            signals.append('RSI Oversold')
-        elif float(latest['RSI'].iloc[0]) > 70:
-            signals.append('RSI Overbought')
-
-        if float(latest['Close'].iloc[0]) > float(latest['EMA_8'].iloc[0]) > float(latest['EMA_20'].iloc[0]):
-            signals.append('Supertrend Buy Signal')
-
-        recent_high = df['High'].iloc[-2:].max()
-        if float(latest['Close'].iloc[0]) > recent_high:
-            signals.append('Pivot Breakout')
-
-        if float(latest['EMA_8'].iloc[0]) > float(latest['EMA_20'].iloc[0]) > float(latest['EMA_200'].iloc[0]):
-            signals.append('MA Crossover Bullish (8 > 20 > 200)')
-
-    except Exception as e:
-        print(f"[{symbol}][{tf}] ERROR in signal detection: {e}")
-        return signals
-
-    if signals:
-        print(f"[{symbol}][{tf}] Signals Found: {signals}")
-    else:
-        print(f"[{symbol}][{tf}] No signals.")
-    return signals
-
-def fetch_and_analyze(symbol, interval):
-    period = '60d' if interval in ['5m', '15m'] else '365d'
-    try:
-        print(f"Fetching {symbol} @ {interval}")
         df = yf.download(symbol, interval=interval, period=period, progress=False)
+        if df.empty or len(df) < 200:
+            return None
         df = calculate_indicators(df)
-        return detect_signals(df, symbol, interval)
+        pp, r1, s1 = get_pivot_levels(df)
+        last = df.iloc[-1]
+
+        if (
+            last['Close'] > last['EMA_200'] and
+            last['EMA_8'] > last['EMA_20'] and
+            last['MACD'] > last['Signal_Line'] and
+            55 < last['RSI'] < 70 and
+            last['Supertrend'] == 'buy' and
+            last['Close'] > r1 and
+            volume_spike(df)
+        ):
+            return {
+                'symbol': symbol,
+                'type': 'BUY',
+                'price': round(last['Close'], 2),
+                'target': round(last['Close'] + 2 * df['ATR'].iloc[-1], 2),
+                'stop_loss': round(last['Close'] - df['ATR'].iloc[-1], 2),
+                'reason': 'MACD+RSI+EMA+Crossover+Pivot+Volume Spike',
+                'confidence': 98
+            }
+        elif (
+            last['Close'] < last['EMA_200'] and
+            last['EMA_8'] < last['EMA_20'] and
+            last['MACD'] < last['Signal_Line'] and
+            30 < last['RSI'] < 45 and
+            last['Supertrend'] == 'sell' and
+            last['Close'] < s1 and
+            volume_spike(df)
+        ):
+            return {
+                'symbol': symbol,
+                'type': 'SELL',
+                'price': round(last['Close'], 2),
+                'target': round(last['Close'] - 2 * df['ATR'].iloc[-1], 2),
+                'stop_loss': round(last['Close'] + df['ATR'].iloc[-1], 2),
+                'reason': 'MACD+RSI+EMA+Breakdown+Pivot+Volume Spike',
+                'confidence': 97
+            }
     except Exception as e:
-        print(f"Error fetching {symbol} @ {interval}: {e}")
-        return []
+        print(f"Error in {symbol}: {e}")
+        return None
 
-def generate_all_signals():
-    result = []
-    stock_list = pd.read_csv("nifty.csv")['Symbol'].tolist()
-
-    for symbol in stock_list:
-        for tf_name, tf_value in TIMEFRAMES.items():
-            signals = fetch_and_analyze(symbol, tf_value)
-            if signals:
-                result.append({
-                    'symbol': symbol,
-                    'timeframe': tf_name,
-                    'signals': signals,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-    return result
+def scan_symbols(symbols):
+    signals = []
+    for symbol in symbols:
+        for interval, period in [('5m', '2d'), ('15m', '5d'), ('1d', '6mo')]:
+            signal = generate_signal(symbol, interval, period)
+            if signal:
+                signals.append(signal)
+                break  # Avoid multiple alerts for same symbol
+    return signals
