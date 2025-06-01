@@ -1,33 +1,29 @@
 import os
-import json
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+firebase_initialized = False
+db = None
 
 try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-
-    FIREBASE_AVAILABLE = True
-
-    if not firebase_admin._apps:
-        cred = credentials.Certificate("firebase/serviceAccountKey.json")
+    cred_path = os.path.join(os.path.dirname(__file__), 'firebase', 'serviceAccountKey.json')
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
-
-    db = firestore.client()
-
+        db = firestore.client()
+        firebase_initialized = True
+    else:
+        print("⚠️ Firebase key not found — Firebase logging will be disabled.")
 except Exception as e:
-    print(f"⚠️ Firebase setup failed: {e}")
-    FIREBASE_AVAILABLE = False
-    db = None
-
-def log_trade_to_firebase(trade_data):
-    if not FIREBASE_AVAILABLE:
-        print("⚠️ Firebase not available. Skipping logging.")
-        return
-    db.collection("trades").add(trade_data)
+    print(f"🔥 Firebase initialization error: {e}")
 
 def fetch_all_trades_from_firebase():
-    if not FIREBASE_AVAILABLE:
-        print("⚠️ Firebase not available. Returning empty list.")
+    if not firebase_initialized or db is None:
         return []
-    trades_ref = db.collection("trades")
-    docs = trades_ref.stream()
-    return [doc.to_dict() for doc in docs]
+    try:
+        trades_ref = db.collection("trades")
+        docs = trades_ref.stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception as e:
+        print(f"❌ Error fetching trades: {e}")
+        return []

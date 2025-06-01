@@ -27,10 +27,10 @@ def performance_report():
             .to_dict(orient="records")
         )
         return jsonify(summary)
-
     except Exception as e:
-        print(f"🔥 ERROR in /performance-report: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True)
