@@ -1,6 +1,6 @@
+
 from flask import Flask, jsonify, request
 from firebase_sync import log_trade_to_firebase, fetch_all_trades_from_firebase
-from strategies import generate_signal_for_symbol
 import pandas as pd
 
 app = Flask(__name__)
@@ -9,28 +9,26 @@ app = Flask(__name__)
 def home():
     return "V3k AI Backend Running"
 
+# Dummy signal generator for compatibility
 @app.route("/get-signals", methods=["GET"])
 def get_signals():
-    # Example hardcoded symbol list; replace with your own logic
-    symbols = ["RELIANCE.NS", "SBIN.NS", "INFY.NS"]
-    signals = []
-
-    for symbol in symbols:
-        try:
-            signal = generate_signal_for_symbol(symbol)
-            if signal:
-                signals.append(signal)
-        except Exception as e:
-            print(f"Error generating signal for {symbol}: {e}")
-    
-    return jsonify(signals)
+    dummy_signals = [
+        {
+            "symbol": "RELIANCE.NS",
+            "direction": "BUY",
+            "strategy": "MACD+RSI",
+            "timeframe": "15m",
+            "price": 2800.0,
+            "strength": 95
+        }
+    ]
+    return jsonify(dummy_signals)
 
 @app.route("/log-trade", methods=["POST"])
 def log_trade():
     trade_data = request.get_json()
     if not trade_data:
         return jsonify({"error": "Invalid payload"}), 400
-    
     try:
         log_trade_to_firebase(trade_data)
         return jsonify({"message": "Trade logged successfully"})
