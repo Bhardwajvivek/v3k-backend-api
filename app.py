@@ -45,6 +45,16 @@ def performance_report():
     if 'result' not in df.columns or 'strategy' not in df.columns:
         return jsonify({"message": "Incomplete trade data"}), 400
 
+    summary = (
+        df.groupby("strategy")["result"]
+        .value_counts()
+        .unstack(fill_value=0)
+        .reset_index()
+        .to_dict(orient="records")
+    )
+
+    return jsonify({"summary": summary})
+
     accuracy = (
         df.groupby("strategy")["result"]
         .value_counts(normalize=True)
