@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 from firebase_sync import fetch_all_trades_from_firebase
 import pandas as pd
+import traceback
 
 app = Flask(__name__)
 
@@ -12,7 +13,8 @@ def home():
 def performance_report():
     try:
         trades = fetch_all_trades_from_firebase()
-        if not trades:
+
+        if not trades or not isinstance(trades, list):
             return jsonify({"message": "No trades found"}), 200
 
         df = pd.DataFrame(trades)
@@ -44,6 +46,7 @@ def performance_report():
         })
 
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
