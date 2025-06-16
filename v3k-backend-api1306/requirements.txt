@@ -8,3 +8,4 @@ firebase-admin==6.5.0
 kiteconnect==4.1.0
 python-dotenv==1.0.1
 gunicorn==21.2.0
+nsepython==1.0.43
