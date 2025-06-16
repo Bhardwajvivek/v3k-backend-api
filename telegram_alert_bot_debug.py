@@ -1,4 +1,3 @@
-
 import requests
 import time
 
@@ -15,10 +14,13 @@ def send_telegram_message(text):
         'parse_mode': 'Markdown'
     }
     try:
-        response = requests.post(url, data=data)
-        print("📤 Telegram sent:", response.status_code, response.text)
+        response = requests.post(url, data=data, timeout=5)
+        if response.status_code == 200:
+            print("✅ Telegram alert sent.")
+        else:
+            print("❌ Failed to send Telegram alert:", response.text)
     except Exception as e:
-        print("❌ Error sending message:", e)
+        print("❌ Telegram Error:", e)
 
 def format_signal(sig):
     return f"""
@@ -26,7 +28,7 @@ def format_signal(sig):
 
 *Symbol:* {sig['symbol']}
 *Strategy:* {sig['strategy']}
-*Type:* {sig['type']}
+*Type:* {sig.get('type', 'N/A')}
 *Timeframe:* {sig['timeframe']}
 *Price:* ₹{sig['price']}
 *Strength:* {sig['strength']}%
@@ -34,23 +36,31 @@ def format_signal(sig):
 
 def run_alert_loop():
     print("🚀 Telegram Alert Bot Started")
-    # Always send a test message once
     send_telegram_message("🧪 Test message from V3k Bot. If you see this, alerts are working!")
 
     while True:
         try:
-            res = requests.get(API_URL)
-            signals = res.json()
+            res = requests.get(API_URL, timeout=10)
+            if res.status_code != 200:
+                print(f"⚠️ Error fetching signals: {res.status_code}")
+                time.sleep(60)
+                continue
 
+            data = res.json()
+            signals = data.get("signals", []) if isinstance(data, dict) else data
+
+            new_alerts = 0
             for sig in signals:
                 uid = f"{sig['symbol']}|{sig['strategy']}|{sig['timeframe']}"
                 if uid not in sent_signals:
-                    message = format_signal(sig)
-                    send_telegram_message(message)
+                    send_telegram_message(format_signal(sig))
                     sent_signals.add(uid)
+                    new_alerts += 1
+
+            print(f"📈 New alerts sent: {new_alerts} | Total tracked: {len(sent_signals)}")
 
         except Exception as e:
-            print("❌ Fetch error:", e)
+            print("❌ Signal fetch error:", e)
 
         time.sleep(60)
 
