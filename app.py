@@ -1,33 +1,38 @@
-from flask import Flask, request, jsonify
+# app.py  —  V3k Backend  (2025-06-16)
+
+from flask import Flask, jsonify
 from flask_cors import CORS
 import traceback
 from datetime import datetime
 import threading
 import time
 import logging
-import os
 
-# Import your strategies and utils
-from strategies import scan_symbols_enhanced, get_signals
+# === Import your signal + index logic ===
+from strategies import scan_symbols_enhanced  # ← make sure this exists
+from nsepython import nse_get_index_quote     # optional – catches import error
 
-# Optional: if using nsepython for index data
-from nsepython import nse_get_index_quote
+# ──────────────────────────────────────────────────────────────
+#  Logging
+# ──────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+logger = logging.getLogger("v3k-backend")
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize app
+# ──────────────────────────────────────────────────────────────
+#  Flask App
+# ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
-# Globals
+# ──────────────────────────────────────────────────────────────
+#  Globals
+# ──────────────────────────────────────────────────────────────
 cached_signals = []
 last_scan_time = None
-auto_refresh_enabled = True
+AUTO_REFRESH = True                  # set False if you only want on-demand scans
+SCAN_INTERVAL_SEC = 300              # 5-minute background refresh
 
-# Scan config
-NIFTY_50_SYMBOLS = [
+NIFTY_50 = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "HINDUNILVR.NS",
     "ICICIBANK.NS", "KOTAKBANK.NS", "BHARTIARTL.NS", "ITC.NS", "SBIN.NS",
     "BAJFINANCE.NS", "LT.NS", "HCLTECH.NS", "ASIANPAINT.NS", "AXISBANK.NS",
@@ -36,108 +41,107 @@ NIFTY_50_SYMBOLS = [
     "COALINDIA.NS", "GRASIM.NS", "HINDALCO.NS", "INDUSINDBK.NS", "M&M.NS"
 ]
 
-# Background scan thread
+# ──────────────────────────────────────────────────────────────
+#  Background Scanner
+# ──────────────────────────────────────────────────────────────
 def background_scanner():
     global cached_signals, last_scan_time
-    while auto_refresh_enabled:
+    threading.current_thread().name = "V3kScanner"
+    while AUTO_REFRESH:
         try:
-            logger.info("🔍 Scanning symbols for live signals...")
-            signals = scan_symbols_enhanced(NIFTY_50_SYMBOLS, ["5m", "15m", "1d"])
+            logger.info("🔍  Scanning symbols for live signals …")
+            signals = scan_symbols_enhanced(NIFTY_50, ["5m", "15m", "1d"])
             cached_signals = signals
-            last_scan_time = datetime.now()
-            logger.info(f"✅ Found {len(signals)} signals.")
+            last_scan_time = datetime.utcnow()
+            logger.info(f"✅  Scan complete — {len(signals)} signals.")
         except Exception as e:
-            logger.error(f"Scan error: {e}")
+            logger.error("Scan error:")
             logger.error(traceback.format_exc())
-        time.sleep(300)  # Every 5 mins
+        time.sleep(SCAN_INTERVAL_SEC)
 
-# Routes
-@app.route("/get-signals", methods=["GET"])
+# Start scanner once server begins serving requests (works with Gunicorn)
+@app.before_first_request
+def launch_background_scanner():
+    if AUTO_REFRESH and not any(t.name == "V3kScanner" for t in threading.enumerate()):
+        logger.info("🔁  Starting background scanner …")
+        threading.Thread(target=background_scanner, daemon=True).start()
+
+# ──────────────────────────────────────────────────────────────
+#  Routes
+# ──────────────────────────────────────────────────────────────
+@app.route("/")
+def root():
+    return "✅ V3k Backend Running"
+
+@app.route("/get-signals")
 def api_get_signals():
+    global cached_signals, last_scan_time
+
+    # On very first call (cold start) run an immediate scan
+    if not cached_signals:
+        try:
+            logger.info("⚡ First-request scan (cold start)")
+            cached_signals = scan_symbols_enhanced(NIFTY_50, ["5m", "15m", "1d"])
+            last_scan_time = datetime.utcnow()
+        except Exception as e:
+            logger.error("Initial scan failed:")
+            logger.error(traceback.format_exc())
+
     return jsonify({
-        "signals": cached_signals,
         "last_scan_time": last_scan_time.isoformat() if last_scan_time else None,
-        "signal_count": len(cached_signals)
+        "signal_count": len(cached_signals),
+        "signals": cached_signals
     })
 
-@app.route("/get-live-indices", methods=["GET"])
-def get_live_indices():
+@app.route("/get-live-indices")
+def api_get_live_indices():
     try:
         index_list = [
             ("Nifty 50", "NIFTY 50"),
-            ("Sensex", "S&P BSE SENSEX"),
+            ("Sensex" , "S&P BSE SENSEX"),
             ("Bank Nifty", "NIFTY BANK"),
             ("Nifty IT", "NIFTY IT"),
             ("Nifty Pharma", "NIFTY PHARMA")
         ]
-        result = []
+        res = []
         for label, code in index_list:
             try:
                 data = nse_get_index_quote(code)
-                result.append({
+                res.append({
                     "symbol": label,
                     "price": data["data"][0]["last"],
                     "change": data["data"][0]["variation"]
                 })
             except Exception:
                 continue
-        return jsonify(result)
+        return jsonify(res)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/get-market-news", methods=["GET"])
-def get_market_news():
-    try:
-        return jsonify([
-            {
-                "title": "Man Buys ₹70,000 Ford After Dealership 'Played With the Numbers'",
-                "url": "https://www.motor1.com/news/761946/ford-buyers-regret/",
-                "source": "Motor1"
-            },
-            {
-                "title": "Executives converge on Washington to halt Trump’s foreign investment tax",
-                "url": "https://www.ft.com/content/e2525100-e432-4987-8b7d-e6f6b32154fe",
-                "source": "Financial Times"
-            },
-            {
-                "title": "Meta in Talks for Scale AI Investment That Could Top $10 Billion",
-                "url": "https://www.bloomberg.com/news/articles/2025-06-08/meta-in-talks-for-scale-ai-investment",
-                "source": "Bloomberg"
-            }
-        ])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/get-market-news")
+def api_get_market_news():
+    return jsonify([
+        {
+            "title": "Man Buys ₹70,000 Ford After Dealership 'Played With the Numbers'",
+            "url": "https://www.motor1.com/news/761946/ford-buyers-regret/",
+            "source": "Motor1"
+        },
+        {
+            "title": "Executives converge on Washington to halt Trump’s foreign investment tax",
+            "url": "https://www.ft.com/content/e2525100-e432-4987-8b7d-e6f6b32154fe",
+            "source": "Financial Times"
+        },
+        {
+            "title": "Meta in Talks for Scale AI Investment That Could Top $10 Billion",
+            "url": "https://www.bloomberg.com/news/articles/2025-06-08/meta-in-talks-for-scale-ai-investment",
+            "source": "Bloomberg"
+        }
+    ])
 
-@app.route("/get-trade-logs", methods=["GET"])
-def get_trade_logs():
-    try:
-        dummy_logs = [
-            {"symbol": "RELIANCE.NS", "action": "BUY", "price": 1448.8, "time": datetime.now().isoformat()},
-            {"symbol": "TCS.NS", "action": "SELL", "price": 3423.0, "time": datetime.now().isoformat()}
-        ]
-        return jsonify(dummy_logs)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/get-strategy-accuracy", methods=["GET"])
-def get_strategy_accuracy():
-    try:
-        dummy_stats = [
-            {"strategy": "MACD Bullish Cross", "accuracy": 78.3, "backtests": 125},
-            {"strategy": "Supertrend Bullish", "accuracy": 83.1, "backtests": 140},
-            {"strategy": "RSI Bullish", "accuracy": 74.5, "backtests": 95}
-        ]
-        return jsonify(dummy_stats)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-# Start server + scanner
+# ──────────────────────────────────────────────────────────────
+#  Manual Run (local dev)
+# ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if auto_refresh_enabled:
-        threading.Thread(target=background_scanner, daemon=True).start()
-        logger.info("🔁 Background scanner started.")
+    if AUTO_REFRESH:
+        launch_background_scanner()
     app.run(host="0.0.0.0", port=5000, debug=False)
