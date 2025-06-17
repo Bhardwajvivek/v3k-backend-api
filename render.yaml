@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: v3k-backend-api
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    pythonVersion: 3.11.9
