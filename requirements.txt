@@ -1,9 +1,0 @@
-Flask==2.2.5
-requests==2.31.0
-yfinance==0.2.36
-pandas==2.2.2
-numpy==1.26.4
-firebase-admin==6.5.0
-kiteconnect==4.1.0
-python-dotenv==1.0.1
-flask-cors==3.0.10
