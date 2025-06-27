@@ -1,0 +1,46 @@
+2025-06-27 22:49:02,005 - werkzeug - INFO - [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.154.229:5000
+2025-06-27 22:49:02,005 - werkzeug - INFO - [33mPress CTRL+C to quit[0m
+2025-06-27 22:52:18,827 - werkzeug - INFO - [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.154.229:5000
+2025-06-27 22:52:18,827 - werkzeug - INFO - [33mPress CTRL+C to quit[0m
+2025-06-27 22:52:45,167 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:45,171 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:53,146 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:53] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:55,151 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:55] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:55,152 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:55] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:55,157 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:55] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:55,163 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:55] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:52:55,170 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:52:55] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:53:25,176 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:53:25] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:53:25,181 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:53:25] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:53:56,157 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:53:56] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:53:56,160 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:53:56] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:54:25,174 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:54:25] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:54:25,182 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:54:25] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:54:55,174 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:54:55] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:54:55,179 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:54:55] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:55:25,188 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:55:25] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:55:25,191 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:55:25] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:55:55,174 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:55:55] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:55:55,180 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:55:55] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:56:26,166 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:56:26] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:56:26,169 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:56:26] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:56:56,165 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:56:56] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:56:56,169 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:56:56] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:57:45,161 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:57:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:57:45,165 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:57:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:58:45,160 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:58:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:58:45,164 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:58:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 22:59:45,161 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:59:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 22:59:45,165 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 22:59:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 23:00:45,168 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:00:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 23:00:45,173 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:00:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 23:01:45,168 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:01:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 23:01:45,171 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:01:45] "GET /get-signals HTTP/1.1" 200 -
+2025-06-27 23:02:45,174 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:02:45] "OPTIONS /get-signals HTTP/1.1" 200 -
+2025-06-27 23:02:45,178 - werkzeug - INFO - 127.0.0.1 - - [27/Jun/2025 23:02:45] "GET /get-signals HTTP/1.1" 200 -
