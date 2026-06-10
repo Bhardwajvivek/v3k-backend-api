@@ -1,5 +1,5 @@
 # COMPLETE V3K AI Trading Bot - Live Signals + AI Features + Advanced Platform
-# Final Production Version - All Syntax Errors Fixed
+# Production Version — /dashboard, /live-stats, /quick-stats routes active
 
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
