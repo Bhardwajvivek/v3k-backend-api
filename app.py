@@ -5716,3 +5716,64 @@ def get_live_stats():
 def get_quick_stats():
     """Alias for live-stats — dashboard quick metrics"""
     return get_live_stats()
+
+
+@app.route("/ai-scan", methods=["POST"])
+def ai_scan():
+    """AI market scanner — returns top trading opportunities from cached signals"""
+    try:
+        all_signals = bot_state.cached_signals + bot_state.cached_options + bot_state.cached_scalping
+        top = sorted(all_signals, key=lambda x: x.get('strength', 0), reverse=True)[:20]
+        return jsonify({
+            "opportunities": top,
+            "signals": top,
+            "count": len(top),
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/toggle-demo-mode", methods=["POST"])
+def toggle_demo_mode():
+    """Toggle demo mode flag (frontend state management)"""
+    try:
+        demo = request.json.get("demo", False) if request.json else False
+        return jsonify({"status": "ok", "demo": demo})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/sector-performance", methods=["GET"])
+def sector_performance():
+    """Get NSE sector index performance (1-day change) using yfinance"""
+    try:
+        import yfinance as yf
+        sector_map = {
+            "IT":     "^CNXit",
+            "Bank":   "^NSEBANK",
+            "Auto":   "^CNXAUTO",
+            "FMCG":   "^CNXFMCG",
+            "Pharma": "^CNXPHARMA",
+            "Energy": "^CNXENERGY",
+            "Metal":  "^CNXMETAL",
+            "Realty": "^CNXREALTY",
+            "Infra":  "^CNXINFRA",
+            "Media":  "^CNXMEDIA",
+        }
+        sectors = []
+        for name, symbol in sector_map.items():
+            try:
+                hist = yf.Ticker(symbol).history(period="2d")
+                if len(hist) >= 2:
+                    chg = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
+                elif len(hist) == 1:
+                    chg = 0.0
+                else:
+                    chg = 0.0
+                sectors.append({"name": name, "change": chg})
+            except Exception:
+                sectors.append({"name": name, "change": 0.0})
+        return jsonify({"sectors": sectors, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        return jsonify({"error": str(e), "sectors": []}), 500
