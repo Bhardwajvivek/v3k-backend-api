@@ -241,8 +241,13 @@
   .crypto-card:hover { border-color: var(--accent-cyan); box-shadow: var(--glow-cyan); }
   .crypto-icon { font-size: 32px; margin-bottom: 8px; }
   .crypto-name { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
-  .crypto-price { font-size: 20px; font-weight: 800; color: var(--accent-cyan); margin-bottom: 4px; }
+  .crypto-price { font-size: 20px; font-weight: 800; color: var(--accent-cyan); margin-bottom: 4px; transition: color 0.2s; }
   .crypto-change { font-size: 13px; font-weight: 700; }
+  @keyframes flashUp   { 0%{background:rgba(0,255,136,0.25);} 100%{background:transparent;} }
+  @keyframes flashDown { 0%{background:rgba(255,71,87,0.25);} 100%{background:transparent;} }
+  .flash-up   { animation: flashUp   0.6s ease-out; }
+  .flash-down { animation: flashDown 0.6s ease-out; }
+  .ws-live::after { content:'● LIVE'; font-size:9px; color:var(--accent-green); margin-left:6px; vertical-align:middle; animation: blink 1.5s infinite; }
 
   /* AI PREDICTIONS */
   .prediction-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
@@ -992,12 +997,12 @@ function renderAllTabs() {
       </div>
     </div>`).join('');
   document.getElementById('cryptoGrid').innerHTML = CRYPTO_DATA.map(c => `
-    <div class="crypto-card">
+    <div class="crypto-card" data-sym="${c.sym}">
       <div class="crypto-icon">${c.icon}</div>
       <div class="crypto-name">${c.name} <span style="color:var(--text-secondary);font-size:11px">${c.sym}</span></div>
       <div class="crypto-price">${c.price}</div>
-      <div class="crypto-change ${c.change>=0?'':''}" style="color:${c.change>=0?'var(--accent-green)':'var(--accent-red)'}">${c.change>=0?'▲':'▼'} ${Math.abs(c.change)}%</div>
-      <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${c.inr}</div>
+      <div class="crypto-chg" style="color:${c.change>=0?'var(--accent-green)':'var(--accent-red)'};font-size:13px;font-weight:600;">${c.change>=0?'▲':'▼'} ${Math.abs(c.change)}%</div>
+      <div class="crypto-inr" style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${c.inr}</div>
     </div>`).join('');
   document.getElementById('calendarList').innerHTML = CALENDAR_DATA.map(e => `
     <div class="cal-item">
@@ -1547,43 +1552,136 @@ async function loadLivePredictions() {
   }).join('');
 }
 
+// ─── CRYPTO: INR rates + Binance WebSocket for real-time prices ──────────────
+const cryptoInrRates  = {};   // sym → INR-per-USD rate
+const cryptoPrevPrice = {};   // sym → last seen price (for flash direction)
+let   cryptoWs        = null;
+
+const CRYPTO_META = {
+  bitcoin:     {icon:'₿', name:'Bitcoin',  sym:'BTC', pair:'btcusdt'},
+  ethereum:    {icon:'Ξ', name:'Ethereum', sym:'ETH', pair:'ethusdt'},
+  binancecoin: {icon:'●', name:'BNB',      sym:'BNB', pair:'bnbusdt'},
+  solana:      {icon:'◎', name:'Solana',   sym:'SOL', pair:'solusdt'},
+  cardano:     {icon:'✦', name:'Cardano',  sym:'ADA', pair:'adausdt'},
+  ripple:      {icon:'◆', name:'Ripple',   sym:'XRP', pair:'xrpusdt'},
+  litecoin:    {icon:'Ł', name:'Litecoin', sym:'LTC', pair:'ltcusdt'},
+  dogecoin:    {icon:'Ð', name:'Dogecoin', sym:'DOGE',pair:'dogeusdt'},
+};
+const PAIR_TO_SYM = Object.fromEntries(
+  Object.values(CRYPTO_META).map(m => [m.pair.toUpperCase()+'T', m.sym])
+    .concat(Object.values(CRYPTO_META).map(m => [m.pair.toUpperCase(), m.sym]))
+);
+// Correct mapping: BTCUSDT → BTC etc.
+const WS_SYM_MAP = {
+  BTCUSDT:'BTC',ETHUSDT:'ETH',BNBUSDT:'BNB',SOLUSDT:'SOL',
+  ADAUSDT:'ADA',XRPUSDT:'XRP',LTCUSDT:'LTC',DOGEUSDT:'DOGE'
+};
+
+function fmtUsd(usd) {
+  if (usd >= 10000) return '$' + usd.toLocaleString('en-US',{maximumFractionDigits:0});
+  if (usd >= 1)     return '$' + usd.toFixed(2);
+  return '$' + usd.toFixed(4);
+}
+function fmtInr(inr) {
+  if (inr >= 10000000) return '₹' + (inr/10000000).toFixed(2) + 'Cr';
+  if (inr >= 100000)   return '₹' + (inr/100000).toFixed(2) + 'L';
+  return '₹' + inr.toLocaleString('en-IN',{maximumFractionDigits:0});
+}
+
+function updateCryptoCard(sym, usdPrice, chgPct24h) {
+  const card = document.querySelector(`.crypto-card[data-sym="${sym}"]`);
+  if (!card) return;
+
+  const prev = cryptoPrevPrice[sym];
+  const dir  = prev === undefined ? '' : usdPrice > prev ? 'up' : usdPrice < prev ? 'down' : '';
+  cryptoPrevPrice[sym] = usdPrice;
+
+  const inrRate = cryptoInrRates[sym] || 83.5;
+  const chg     = parseFloat((chgPct24h||0).toFixed(2));
+
+  const priceEl = card.querySelector('.crypto-price');
+  const chgEl   = card.querySelector('.crypto-chg');
+  const inrEl   = card.querySelector('.crypto-inr');
+
+  if (priceEl) {
+    priceEl.textContent = fmtUsd(usdPrice);
+    if (dir) {
+      card.classList.remove('flash-up','flash-down');
+      void card.offsetWidth; // force reflow to restart animation
+      card.classList.add('flash-' + dir);
+    }
+  }
+  if (chgEl) {
+    chgEl.textContent = (chg >= 0 ? '▲ ' : '▼ ') + Math.abs(chg) + '%';
+    chgEl.style.color = chg >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+  }
+  if (inrEl) inrEl.textContent = fmtInr(usdPrice * inrRate);
+}
+
+function connectCryptoWebSocket() {
+  if (cryptoWs && cryptoWs.readyState < 2) return;
+
+  const streams = Object.values(CRYPTO_META).map(m => m.pair + '@miniTicker').join('/');
+  cryptoWs = new WebSocket('wss://stream.binance.com:9443/stream?streams=' + streams);
+
+  cryptoWs.onopen = () => {
+    const el = document.getElementById('cryptoGrid');
+    if (el) el.classList.add('ws-live');
+  };
+
+  cryptoWs.onmessage = (e) => {
+    try {
+      const { data: t } = JSON.parse(e.data);
+      if (!t || !t.s) return;
+      const sym = WS_SYM_MAP[t.s];
+      if (!sym) return;
+      const price = parseFloat(t.c);
+      const open  = parseFloat(t.o);
+      const chg24 = open > 0 ? (price - open) / open * 100 : 0;
+      updateCryptoCard(sym, price, chg24);
+    } catch {}
+  };
+
+  cryptoWs.onclose = () => {
+    setTimeout(connectCryptoWebSocket, 5000); // auto-reconnect
+  };
+  cryptoWs.onerror = () => cryptoWs.close();
+}
+
 async function loadLiveCrypto() {
+  // Build card structure first (with data-sym) so WS updates have targets
+  const icons = {BTC:'₿',ETH:'Ξ',BNB:'●',SOL:'◎',ADA:'✦',XRP:'◆',LTC:'Ł',DOGE:'Ð'};
+  const names = {BTC:'Bitcoin',ETH:'Ethereum',BNB:'BNB',SOL:'Solana',ADA:'Cardano',XRP:'Ripple',LTC:'Litecoin',DOGE:'Dogecoin'};
+  const existing = document.querySelectorAll('.crypto-card[data-sym]');
+  if (existing.length < 8) {
+    document.getElementById('cryptoGrid').innerHTML = Object.keys(icons).map(sym => `
+      <div class="crypto-card" data-sym="${sym}">
+        <div class="crypto-icon">${icons[sym]}</div>
+        <div class="crypto-name">${names[sym]} <span style="color:var(--text-secondary);font-size:11px">${sym}</span></div>
+        <div class="crypto-price">—</div>
+        <div class="crypto-chg" style="font-size:13px;font-weight:600;">— %</div>
+        <div class="crypto-inr" style="font-size:11px;color:var(--text-secondary);margin-top:4px;">—</div>
+      </div>`).join('');
+  }
+
+  // Fetch INR conversion rates from CoinGecko once
   try {
     const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,solana,cardano,ripple,litecoin,dogecoin&vs_currencies=usd,inr&include_24hr_change=true';
     const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!r.ok) return;
-    const prices = await r.json();
-    const META = {
-      bitcoin:     {icon:'₿',name:'Bitcoin',   sym:'BTC'},
-      ethereum:    {icon:'Ξ',name:'Ethereum',  sym:'ETH'},
-      binancecoin: {icon:'●',name:'BNB',        sym:'BNB'},
-      solana:      {icon:'◎',name:'Solana',     sym:'SOL'},
-      cardano:     {icon:'✦',name:'Cardano',    sym:'ADA'},
-      ripple:      {icon:'◆',name:'Ripple',     sym:'XRP'},
-      litecoin:    {icon:'Ł',name:'Litecoin',   sym:'LTC'},
-      dogecoin:    {icon:'Ð',name:'Dogecoin',   sym:'DOGE'},
-    };
-    const html = Object.entries(META).map(([id, m]) => {
-      const d = prices[id]; if (!d) return '';
-      const usd = d.usd || 0;
-      const inr = d.inr || 0;
-      const chg = parseFloat((d.usd_24h_change||0).toFixed(2));
-      const fUsd = usd >= 1000
-        ? '$' + usd.toLocaleString('en-US',{maximumFractionDigits:0})
-        : '$' + usd.toFixed(usd < 1 ? 4 : 2);
-      const fInr = inr >= 100000
-        ? '₹' + (inr/100000).toFixed(2) + 'L'
-        : '₹' + inr.toLocaleString('en-IN',{maximumFractionDigits:0});
-      return `<div class="crypto-card">
-        <div class="crypto-icon">${m.icon}</div>
-        <div class="crypto-name">${m.name} <span style="color:var(--text-secondary);font-size:11px">${m.sym}</span></div>
-        <div class="crypto-price">${fUsd}</div>
-        <div style="color:${chg>=0?'var(--accent-green)':'var(--accent-red)'};font-size:13px;font-weight:600;">${chg>=0?'▲':'▼'} ${Math.abs(chg)}%</div>
-        <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${fInr}</div>
-      </div>`;
-    }).join('');
-    document.getElementById('cryptoGrid').innerHTML = html;
-  } catch(e) { console.warn('Crypto load failed:', e.message); }
+    if (r.ok) {
+      const data = await r.json();
+      const cgMap = {bitcoin:'BTC',ethereum:'ETH',binancecoin:'BNB',solana:'SOL',cardano:'ADA',ripple:'XRP',litecoin:'LTC',dogecoin:'DOGE'};
+      for (const [id, sym] of Object.entries(cgMap)) {
+        if (data[id] && data[id].usd) {
+          cryptoInrRates[sym] = data[id].inr / data[id].usd;
+          updateCryptoCard(sym, data[id].usd, data[id].usd_24h_change || 0);
+        }
+      }
+    }
+  } catch(e) { console.warn('CoinGecko INR fetch failed:', e.message); }
+
+  // Connect Binance WebSocket — prices now update every ~1 second
+  connectCryptoWebSocket();
 }
 
 async function loadLiveRisk() {
