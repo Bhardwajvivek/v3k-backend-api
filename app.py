@@ -5777,3 +5777,97 @@ def sector_performance():
         return jsonify({"sectors": sectors, "timestamp": datetime.now().isoformat()})
     except Exception as e:
         return jsonify({"error": str(e), "sectors": []}), 500
+
+
+@app.route("/us-market-status", methods=["GET"])
+def us_market_status():
+    """Return whether US market is currently open"""
+    try:
+        from datetime import timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        now_et  = now_utc - timedelta(hours=4)  # EDT (approx; good enough)
+        weekday = now_et.weekday()  # Mon=0, Sun=6
+        hour    = now_et.hour + now_et.minute / 60
+        open_   = (weekday < 5) and (9.5 <= hour < 16)
+        return jsonify({
+            "open": open_,
+            "market": "US",
+            "time_et": now_et.strftime("%H:%M"),
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "open": False}), 500
+
+
+@app.route("/get-us-signals", methods=["GET"])
+def get_us_signals():
+    """Return US stock signals — reuses existing signal engine on US tickers"""
+    try:
+        import yfinance as yf
+        us_tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+                      "TSLA", "JPM", "AMD", "NFLX", "INTC", "QCOM",
+                      "ADBE", "CRM", "ORCL", "SBUX", "DIS", "BA"]
+        signals = []
+        for sym in us_tickers:
+            try:
+                hist = yf.Ticker(sym).history(period="5d", interval="1d")
+                if len(hist) < 2:
+                    continue
+                close  = hist["Close"].iloc[-1]
+                prev   = hist["Close"].iloc[-2]
+                change = round((close - prev) / prev * 100, 2)
+                action = "BUY" if change > 0.5 else ("SELL" if change < -0.5 else "HOLD")
+                signals.append({
+                    "symbol":   sym,
+                    "action":   action,
+                    "price":    round(close, 2),
+                    "change":   change,
+                    "market":   "US",
+                    "strength": round(abs(change) * 10, 1),
+                    "type":     "Swing",
+                    "target":   round(close * (1.03 if action == "BUY" else 0.97), 2),
+                    "sl":       round(close * (0.98 if action == "BUY" else 1.02), 2),
+                })
+            except Exception:
+                continue
+        signals.sort(key=lambda x: x["strength"], reverse=True)
+        return jsonify({
+            "signals":    signals,
+            "us_signals": signals,
+            "count":      len(signals),
+            "timestamp":  datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "signals": [], "us_signals": []}), 500
+
+
+@app.route("/watchlist-prices", methods=["POST"])
+def watchlist_prices():
+    """Fetch latest price + 1-day change for a list of symbols (NSE and US)"""
+    try:
+        import yfinance as yf
+        data    = request.json or {}
+        symbols = data.get("symbols", [])[:30]  # cap at 30
+        prices  = {}
+        for sym in symbols:
+            try:
+                # Auto-detect NSE vs US: if no exchange suffix and not in US list, add .NS
+                us_set = {"AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","JPM",
+                          "JNJ","V","UNH","HD","PG","MA","DIS","BAC","ADBE","CRM","NFLX",
+                          "INTC","AMD","QCOM","ORCL","SBUX","COIN","PYPL","UBER","PLTR","SPY","QQQ"}
+                ticker_sym = sym if (sym in us_set or "." in sym) else sym + ".NS"
+                hist = yf.Ticker(ticker_sym).history(period="2d", interval="1d")
+                if len(hist) >= 2:
+                    price  = round(hist["Close"].iloc[-1], 2)
+                    change = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
+                elif len(hist) == 1:
+                    price  = round(hist["Close"].iloc[-1], 2)
+                    change = 0.0
+                else:
+                    continue
+                prices[sym] = {"price": price, "change": change}
+            except Exception:
+                continue
+        return jsonify({"prices": prices, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        return jsonify({"error": str(e), "prices": {}}), 500
