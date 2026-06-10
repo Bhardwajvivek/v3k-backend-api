@@ -454,12 +454,10 @@
     <div class="filters-top">
       <strong style="font-size:13px;">🎛️ Filters</strong>
       <div class="filter-btns">
-        <span class="filter-chip active" onclick="toggleChip(this,'perfect')">Perfect 100%</span>
-        <span class="filter-chip" onclick="toggleChip(this,'highquality')">High Quality</span>
-        <span class="filter-chip" onclick="toggleChip(this,'buy')">BUY Only</span>
-        <span class="filter-chip" onclick="toggleChip(this,'sell')">SELL Only</span>
-        <span class="filter-chip" onclick="toggleChip(this,'intraday')">Intraday</span>
-        <span class="filter-chip" onclick="toggleChip(this,'swing')">Swing</span>
+        <span class="filter-chip" data-filter="buy" onclick="toggleChip(this,'buy')">BUY Only</span>
+        <span class="filter-chip" data-filter="sell" onclick="toggleChip(this,'sell')">SELL Only</span>
+        <span class="filter-chip" data-filter="intraday" onclick="toggleChip(this,'intraday')">Intraday</span>
+        <span class="filter-chip" data-filter="swing" onclick="toggleChip(this,'swing')">Swing</span>
         <span class="filter-chip" onclick="resetFilters()" style="color:var(--accent-red);border-color:var(--accent-red)">↺ Reset</span>
       </div>
     </div>
@@ -854,8 +852,6 @@ let state = {
   tickerPrices: {}
 };
 
-const API_BASE = 'http://localhost:5000';
-
 // ─── INIT ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   buildTicker();
@@ -865,21 +861,37 @@ document.addEventListener('DOMContentLoaded', async () => {
   drawSectorHeatmap();
   initClock();
   appendChatMsg('bot', AI_RESPONSES.default);
+  loadLiveCrypto();     // crypto uses CoinGecko directly, no backend needed
 
   // Try to connect to backend — if found, load live data
   const found = await checkBackend();
   if (found) {
-    loadLiveSignals();
-    loadLiveNews();
-    loadLiveIndices();
-    loadLiveStats();
+    loadAllLive();
   } else {
-    showToast('Demo mode — no backend found. Open http://localhost:5000 or Render is waking up.', 'warning');
+    showToast('Demo mode — Render may be waking up (~30s). Will auto-retry.', 'warning');
+    // Auto-retry once after 35s (Render cold start)
+    setTimeout(async () => {
+      const retry = await checkBackend();
+      if (retry) { loadAllLive(); showToast('Backend connected — loading live data!', 'success'); }
+    }, 35000);
   }
 
   startAutoRefresh();
   setTimeout(() => showRiskModal(), 10000);
 });
+
+function loadAllLive() {
+  loadLiveSignals();
+  loadLiveNews();
+  loadLiveIndices();
+  loadLiveStats();
+  loadLivePortfolio();
+  loadLiveSentiment();
+  loadLivePredictions();
+  loadLiveRisk();
+  loadLiveTicker();
+  loadLiveSectors();
+}
 
 // ─── TICKER ──────────────────────────────────────────────────────────────────
 function buildTicker() {
@@ -1046,11 +1058,26 @@ function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
-  document.querySelectorAll('.tab-btn').forEach(b=>{ if(b.textContent.trim().toLowerCase().includes(name.replace('aiscanner','ai scanner').replace('aipred','ai pred').replace('multitf','multi').replace('aichat','ai chat').replace('calendar','cal'))) b.classList.add('active'); });
+  document.querySelectorAll('.tab-btn').forEach(b=>{
+    if(b.textContent.trim().toLowerCase().includes(
+      name.replace('aiscanner','ai scanner').replace('aipred','ai pred')
+          .replace('multitf','multi').replace('aichat','ai chat').replace('calendar','cal')
+    )) b.classList.add('active');
+  });
   document.getElementById('perfChartSection').style.display = name==='signals' ? 'block' : 'none';
   state.activeTab = name;
-  // Update sidebar active
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+
+  // Lazy-load live data when tab is opened
+  if (state.backendConnected) {
+    if (name === 'portfolio')  loadLivePortfolio();
+    if (name === 'sentiment')  loadLiveSentiment();
+    if (name === 'aipred')     loadLivePredictions();
+    if (name === 'news')       loadLiveNews();
+    if (name === 'aiscanner')  { /* triggered by runAiScan button */ }
+    if (name === 'risk')       loadLiveRisk();
+  }
+  if (name === 'crypto') loadLiveCrypto();
 }
 
 // ─── CONTROLS ────────────────────────────────────────────────────────────────
@@ -1158,7 +1185,36 @@ function resetFilters() {
   showToast('Filters reset to default values.','info');
   filterSignals();
 }
-function filterSignals() { /* Live filtering would apply here; demo shows all */ }
+function filterSignals() {
+  const active = [...document.querySelectorAll('.filter-chip.active')].map(c =>
+    (c.dataset.filter || c.textContent.trim()).toLowerCase());
+  const minStr  = parseInt(document.getElementById('strengthSlider')?.value || 70);
+  const minConf = parseInt(document.getElementById('confSlider')?.value    || 65);
+
+  document.querySelectorAll('.signal-card').forEach(card => {
+    const type = card.classList.contains('buy') ? 'buy'
+               : card.classList.contains('sell') ? 'sell' : 'hold';
+    const catEl = [...card.querySelectorAll('.signal-metric-value')].find(e =>
+      e.textContent.match(/INTRADAY|SWING/i));
+    const cat = catEl ? catEl.textContent.trim().toLowerCase() : '';
+
+    // Read strength % from the text of the strength metric value
+    const strEl = [...card.querySelectorAll('.signal-metric-value')]
+      .find(e => /^\d+%$/.test(e.textContent.trim()));
+    const str = strEl ? parseInt(strEl.textContent) : 100;
+
+    let show = str >= minStr;
+
+    if (active.length > 0) {
+      const typeTokens = active.filter(f => ['buy','sell','hold'].includes(f));
+      const catTokens  = active.filter(f => ['intraday','swing'].includes(f));
+      if (typeTokens.length && !typeTokens.includes(type)) show = false;
+      if (catTokens.length  && !catTokens.includes(cat))  show = false;
+    }
+
+    card.style.display = show ? '' : 'none';
+  });
+}
 function updateAlertLevel(v) {
   const labels = ['HIGH','MEDIUM','LOW'];
   document.getElementById('alertVal').textContent = labels[v];
@@ -1203,19 +1259,26 @@ function startAutoRefresh() {
   clearInterval(state.autoInterval);
   state.autoInterval = setInterval(async () => {
     if (!state.autoRefresh) return;
-    updateTickerPrices(); // always animate ticker locally
+    updateTickerPrices();
     if (state.backendConnected) {
-      await loadLiveStats();
-      await loadLiveIndices();
+      loadLiveStats();
+      loadLiveIndices();
+      loadLiveSignals();
+      loadLiveSentiment();
+      loadLiveSectors();
+      loadLiveTicker();
+      if (state.activeTab === 'portfolio')   loadLivePortfolio();
+      if (state.activeTab === 'aipred')      loadLivePredictions();
+      if (state.activeTab === 'news')        loadLiveNews();
     } else {
-      updateLiveStats(); // demo fallback
+      updateLiveStats();
     }
-  }, 30000); // 30s — matches backend scan interval
+    loadLiveCrypto(); // always refresh crypto (CoinGecko, no backend needed)
+  }, 30000);
 
-  // Also do a fast local tick every 3s for animations only
+  // Fast local tick every 3s for price animation only
   setInterval(() => {
     updateTickerPrices();
-    // Jiggle mini widget even in demo
     if (!state.backendConnected) updateLiveStats();
   }, 3000);
 }
@@ -1400,6 +1463,169 @@ async function loadLiveStats() {
     const dot = document.getElementById('backendDot');
     dot.classList.toggle('connected', data.scan_status !== 'error');
   }
+}
+
+// ─── LIVE LOADERS (Portfolio, Sentiment, Predictions, Crypto, Risk, Ticker, Sectors) ──
+
+async function loadLivePortfolio() {
+  const data = await apiGet('/portfolio', null) || await apiGet('/portfolio-summary', null);
+  if (!data) return;
+  const pos = data.portfolio?.positions || data.positions || data.holdings || [];
+  if (!pos.length) return;
+  document.getElementById('portfolioGrid').innerHTML = pos.map(p => {
+    const pnl    = p.pnl || p.unrealized_pnl || 0;
+    const pnlPct = parseFloat(p.pnl_pct || p.unrealized_pnl_pct || 0).toFixed(2);
+    const qty    = p.qty || p.quantity || 0;
+    const avg    = p.avg || p.avg_price || p.average_price || 0;
+    const ltp    = p.ltp || p.current_price || p.last_price || 0;
+    return `<div class="position-card">
+      <div class="position-header">
+        <div><div class="position-symbol">${p.sym||p.symbol||'—'}</div>
+        <div style="font-size:11px;color:var(--text-secondary)">${p.sector||'—'}</div></div>
+        <div class="position-pnl ${pnl>=0?'profit':'loss'}">${pnl>=0?'+':''}₹${Math.abs(pnl).toLocaleString('en-IN')} (${pnlPct>=0?'+':''}${pnlPct}%)</div>
+      </div>
+      <div class="position-details">
+        <div class="position-detail">Qty: <span>${qty}</span></div>
+        <div class="position-detail">Avg: <span>₹${avg.toLocaleString('en-IN')}</span></div>
+        <div class="position-detail">LTP: <span>₹${ltp.toLocaleString('en-IN')}</span></div>
+        <div class="position-detail">Value: <span>₹${(qty*ltp).toLocaleString('en-IN')}</span></div>
+      </div>
+    </div>`;
+  }).join('');
+  const totalPnl = pos.reduce((s,p) => s + (p.pnl||p.unrealized_pnl||0), 0);
+  ['portPnl','sc3','pnlVal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = (totalPnl>=0?'+':'')+'₹'+Math.abs(totalPnl).toLocaleString('en-IN');
+  });
+}
+
+async function loadLiveSentiment() {
+  const data = await apiGet('/ai-market-summary', null);
+  if (!data) return;
+  const ctx = data.market_context || {};
+  const bull = ctx.bullish_signals || ctx.buy_signals || 0;
+  const bear = ctx.bearish_signals || ctx.sell_signals || 0;
+  const total = bull + bear || 1;
+  const score = Math.round((bull / total) * 100);
+  document.getElementById('sentGauge').textContent = score;
+  const sentLabel = document.getElementById('sentLabel');
+  if (sentLabel) sentLabel.textContent = score >= 65 ? 'Bullish' : score >= 45 ? 'Neutral' : 'Bearish';
+  // Also push AI summary to predictions section
+  const summaryEl = document.getElementById('aiSummaryText');
+  if (summaryEl && data.ai_summary) summaryEl.textContent = data.ai_summary;
+}
+
+async function loadLivePredictions() {
+  const [mkt, sigData] = await Promise.all([
+    apiGet('/ai-market-summary', null),
+    apiGet('/get-signals', null)
+  ]);
+  const raw = sigData
+    ? (sigData.signals || sigData.equity_signals || (Array.isArray(sigData) ? sigData : []))
+    : [];
+  const top4 = raw.slice(0, 4);
+  if (!top4.length) return;
+  document.getElementById('predList').innerHTML = top4.map(s => {
+    const sym   = s.display_symbol || (s.symbol||'').replace('.NS','');
+    const isUp  = !(s.signalType||s.type||'buy').toLowerCase().includes('sell');
+    const price = s.price || s.entry || 0;
+    const t1    = s.target || s.exit || 0;
+    const pct   = price > 0 ? ((t1-price)/price*100).toFixed(1) : '0';
+    const conf  = s.confidence || s.strength || 75;
+    const cls   = conf >= 80 ? 'high' : conf >= 60 ? 'medium' : 'low';
+    const tf    = s.timeframe ? s.timeframe.replace('m',' min') : 'intraday';
+    const why   = (s.strategyTags||[s.strategy||'']).filter(Boolean).join(', ')
+                  || 'AI multi-factor confluence signal.';
+    return `<div class="prediction-card">
+      <div class="pred-header">
+        <div class="pred-symbol">${sym} — <span style="font-size:12px;color:var(--text-secondary)">${tf}</span></div>
+        <span class="pred-confidence ${cls}">AI ${conf}%</span>
+      </div>
+      <div class="pred-direction ${isUp?'up':'down'}">${isUp?'▲ BULLISH':'▼ BEARISH'} → ₹${t1.toLocaleString('en-IN')} (${isUp?'+':''}${pct}%)</div>
+      <div class="pred-reasoning">${why}</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadLiveCrypto() {
+  try {
+    const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,solana,cardano,ripple,litecoin,dogecoin&vs_currencies=usd,inr&include_24hr_change=true';
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return;
+    const prices = await r.json();
+    const META = {
+      bitcoin:     {icon:'₿',name:'Bitcoin',   sym:'BTC'},
+      ethereum:    {icon:'Ξ',name:'Ethereum',  sym:'ETH'},
+      binancecoin: {icon:'●',name:'BNB',        sym:'BNB'},
+      solana:      {icon:'◎',name:'Solana',     sym:'SOL'},
+      cardano:     {icon:'✦',name:'Cardano',    sym:'ADA'},
+      ripple:      {icon:'◆',name:'Ripple',     sym:'XRP'},
+      litecoin:    {icon:'Ł',name:'Litecoin',   sym:'LTC'},
+      dogecoin:    {icon:'Ð',name:'Dogecoin',   sym:'DOGE'},
+    };
+    const html = Object.entries(META).map(([id, m]) => {
+      const d = prices[id]; if (!d) return '';
+      const usd = d.usd || 0;
+      const inr = d.inr || 0;
+      const chg = parseFloat((d.usd_24h_change||0).toFixed(2));
+      const fUsd = usd >= 1000
+        ? '$' + usd.toLocaleString('en-US',{maximumFractionDigits:0})
+        : '$' + usd.toFixed(usd < 1 ? 4 : 2);
+      const fInr = inr >= 100000
+        ? '₹' + (inr/100000).toFixed(2) + 'L'
+        : '₹' + inr.toLocaleString('en-IN',{maximumFractionDigits:0});
+      return `<div class="crypto-card">
+        <div class="crypto-icon">${m.icon}</div>
+        <div class="crypto-name">${m.name} <span style="color:var(--text-secondary);font-size:11px">${m.sym}</span></div>
+        <div class="crypto-price">${fUsd}</div>
+        <div style="color:${chg>=0?'var(--accent-green)':'var(--accent-red)'};font-size:13px;font-weight:600;">${chg>=0?'▲':'▼'} ${Math.abs(chg)}%</div>
+        <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${fInr}</div>
+      </div>`;
+    }).join('');
+    document.getElementById('cryptoGrid').innerHTML = html;
+  } catch(e) { console.warn('Crypto load failed:', e.message); }
+}
+
+async function loadLiveRisk() {
+  const alerts = await apiGet('/risk-alerts', null);
+  if (!alerts) return;
+  const riskAlerts = alerts.alerts || alerts.risk_alerts || [];
+  riskAlerts.filter(a => (a.severity||'').toLowerCase() === 'high').forEach(a => {
+    showToast('⚠️ Risk Alert: ' + (a.message || a.description || ''), 'warning');
+  });
+}
+
+async function loadLiveTicker() {
+  const data = await apiGet('/live-prices', null);
+  if (!data || !data.live_prices) return;
+  const prices  = data.live_prices  || {};
+  const changes = data.price_changes || {};
+  document.querySelectorAll('.ticker-item').forEach(el => {
+    const sym = el.querySelector('.ticker-symbol')?.textContent;
+    if (sym && prices[sym] !== undefined) {
+      const p = prices[sym];
+      const c = changes[sym] || 0;
+      el.querySelector('.ticker-price').textContent = '₹' + p.toLocaleString('en-IN');
+      const ch = el.querySelector('.ticker-change');
+      ch.textContent = (c>=0?'▲':'▼') + Math.abs(c) + '%';
+      ch.className = 'ticker-change ' + (c>=0?'up':'down');
+    }
+  });
+}
+
+async function loadLiveSectors() {
+  const data = await apiGet('/sector-performance', null);
+  if (!data || !data.sectors?.length) return;
+  document.getElementById('sectorHeatmap').innerHTML = data.sectors.map(s => {
+    const v = s.change || 0;
+    const bg = v >= 0
+      ? `rgba(0,255,136,${Math.min(Math.abs(v)/5,0.6)+0.1})`
+      : `rgba(255,71,87,${Math.min(Math.abs(v)/5,0.6)+0.1})`;
+    return `<div class="heat-cell" style="background:${bg}">
+      <div>${v>=0?'+':''}${v.toFixed(1)}%</div>
+      <div class="sector">${s.name}</div>
+    </div>`;
+  }).join('');
 }
 
 // ─── TOAST ───────────────────────────────────────────────────────────────────
