@@ -5871,3 +5871,101 @@ def watchlist_prices():
         return jsonify({"prices": prices, "timestamp": datetime.now().isoformat()})
     except Exception as e:
         return jsonify({"error": str(e), "prices": {}}), 500
+
+
+# ─── ZERODHA KITE — live holdings (read-only) ─────────────────────────────────
+# api_key is publishable; the SECRET must be set as an env var on the host:
+#   Render → Environment → KITE_API_SECRET = <your Kite app secret>
+import os as _os
+import json as _json
+KITE_API_KEY    = _os.environ.get("KITE_API_KEY", "58rfw7ndiljinul2")
+KITE_API_SECRET = _os.environ.get("KITE_API_SECRET", "")
+_KITE_TOKEN_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "kite_token.json")
+
+def _kite_save_token(token):
+    try:
+        with open(_KITE_TOKEN_FILE, "w") as f:
+            _json.dump({"access_token": token, "date": datetime.now().strftime("%Y-%m-%d")}, f)
+    except Exception:
+        pass
+
+def _kite_load_token():
+    try:
+        with open(_KITE_TOKEN_FILE) as f:
+            d = _json.load(f)
+        # Kite tokens expire ~6 AM IST daily — only trust tokens saved today
+        if d.get("date") == datetime.now().strftime("%Y-%m-%d"):
+            return d.get("access_token")
+    except Exception:
+        pass
+    return None
+
+@app.route("/zerodha/login-url", methods=["GET"])
+def zerodha_login_url():
+    return jsonify({"url": f"https://kite.zerodha.com/connect/login?v=3&api_key={KITE_API_KEY}"})
+
+@app.route("/zerodha/session", methods=["POST"])
+def zerodha_session():
+    """Exchange a request_token (from the Kite redirect) for a daily access_token."""
+    try:
+        if not KITE_API_SECRET:
+            return jsonify({"status": "error", "message": "KITE_API_SECRET env var not set on server"}), 500
+        body = request.json or {}
+        rt = body.get("request_token")
+        if not rt:
+            return jsonify({"status": "error", "message": "request_token missing"}), 400
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        data = kite.generate_session(rt, api_secret=KITE_API_SECRET)
+        _kite_save_token(data["access_token"])
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/zerodha/holdings", methods=["GET"])
+def zerodha_holdings():
+    """Return live Zerodha holdings if connected today; else connected=False."""
+    try:
+        token = _kite_load_token()
+        if not token:
+            return jsonify({"connected": False, "holdings": [],
+                            "message": "Not connected — log in to Zerodha for today"})
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=KITE_API_KEY)
+        kite.set_access_token(token)
+        raw = kite.holdings()
+        holdings, total_inv, total_val = [], 0.0, 0.0
+        for h in raw:
+            qty   = h.get("quantity", 0) + h.get("t1_quantity", 0)
+            avg   = h.get("average_price", 0)
+            ltp   = h.get("last_price", 0)
+            inv   = avg * qty
+            val   = ltp * qty
+            pnl   = h.get("pnl", val - inv)
+            total_inv += inv; total_val += val
+            holdings.append({
+                "sym": h.get("tradingsymbol", ""),
+                "qty": qty, "avg": round(avg, 2), "ltp": round(ltp, 2),
+                "value": round(val, 2), "pnl": round(pnl, 2),
+                "pnlPct": round((pnl / inv * 100), 2) if inv else 0.0,
+                "sector": h.get("exchange", "NSE"),
+            })
+        return jsonify({
+            "connected": True, "holdings": holdings,
+            "total_invested": round(total_inv, 2),
+            "total_value": round(total_val, 2),
+            "total_pnl": round(total_val - total_inv, 2),
+            "total_pnl_pct": round((total_val - total_inv) / total_inv * 100, 2) if total_inv else 0.0,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"connected": False, "holdings": [], "error": str(e)}), 500
+
+@app.route("/zerodha/disconnect", methods=["POST"])
+def zerodha_disconnect():
+    try:
+        if _os.path.exists(_KITE_TOKEN_FILE):
+            _os.remove(_KITE_TOKEN_FILE)
+    except Exception:
+        pass
+    return jsonify({"status": "ok"})
