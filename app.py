@@ -5969,3 +5969,172 @@ def zerodha_disconnect():
     except Exception:
         pass
     return jsonify({"status": "ok"})
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  24/7 ALERT WORKER — computes signals + fires Telegram alerts server-side.
+#  Nothing needs to be open on any phone/computer. Trigger /cron/scan from a
+#  free scheduler (cron-job.org) every ~15 min, or rely on the background loop.
+# ═══════════════════════════════════════════════════════════════════════════
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8130024944:AAGwJN20vp5CryTsdUhiXw6wuA-hZ3m0Fig")
+TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "6955435826")
+_ALERTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v3k_alerts.json")
+_notified_signals = set()
+
+def _tg_send(text, chat=None):
+    try:
+        requests.get("https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
+                     params={"chat_id": chat or TG_CHAT, "text": text}, timeout=10)
+    except Exception:
+        pass
+
+def _alerts_load():
+    try:
+        with open(_ALERTS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _alerts_save(a):
+    try:
+        with open(_ALERTS_FILE, "w") as f:
+            json.dump(a, f)
+    except Exception:
+        pass
+
+def _ema(vals, n):
+    out = [None] * len(vals); k = 2.0 / (n + 1); prev = None
+    for i, v in enumerate(vals):
+        v = prev if v is None else v
+        if v is None:
+            out[i] = None; continue
+        prev = v if prev is None else v * k + prev * (1 - k); out[i] = prev
+    return out
+
+def _rsi_last(c, n=14):
+    ag = al = 0.0; out = None
+    for i in range(1, len(c)):
+        d = (c[i] or c[i - 1]) - (c[i - 1] or c[i]); g = max(d, 0); l = max(-d, 0)
+        if i <= n:
+            ag += g; al += l
+            if i == n:
+                ag /= n; al /= n; out = 100 if al == 0 else 100 - 100 / (1 + ag / al)
+        else:
+            ag = (ag * (n - 1) + g) / n; al = (al * (n - 1) + l) / n
+            out = 100 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out if out is not None else 50
+
+def _composite_signal(sym):
+    """Same multi-factor composite as the frontend, computed server-side."""
+    h = yf.Ticker(sym).history(period="1y", interval="1d")
+    if len(h) < 60:
+        return None
+    c = list(h["Close"]); hi = list(h["High"])
+    i = len(c) - 1
+    e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
+    e12 = _ema(c, 12); e26 = _ema(c, 26)
+    macd = [(e12[j] - e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
+    sig = _ema([0 if x is None else x for x in macd], 9)
+    hist = (macd[i] or 0) - (sig[i] or 0)
+    rsi = _rsi_last(c)
+    dh = max(hi[i - 20:i]) if i >= 20 else hi[i]
+    price = c[i]; s = 0
+    if e20[i] and e50[i]:  s += 1 if e20[i] > e50[i] else -1
+    if e50[i] and e200[i]: s += 1 if e50[i] > e200[i] else -1
+    if e20[i]:             s += 1 if price > e20[i] else -1
+    s += 1 if hist > 0 else -1
+    if rsi:
+        if 52 < rsi < 78: s += 1
+        elif 22 < rsi < 48: s -= 1
+    s += 1 if price >= dh else -1
+    typ = "BULLISH" if s >= 3 else ("BEARISH" if s <= -3 else "NEUTRAL")
+    return {"sym": sym, "score": s, "type": typ, "price": round(price, 2)}
+
+_WATCH_IN = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS",
+             "TATAMOTORS.NS","BHARTIARTL.NS","LT.NS","AXISBANK.NS","MARUTI.NS","SUNPHARMA.NS"]
+_WATCH_US = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","JPM","NFLX","AVGO","QCOM"]
+
+def _run_scan():
+    """One scan cycle: new strong signals + price-alert checks → Telegram."""
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    istmin = (now.hour * 60 + now.minute + 330) % 1440
+    us = (istmin >= 1140 or istmin <= 90)
+    syms = _WATCH_US if us else _WATCH_IN
+    new = []
+    for sym in syms:
+        try:
+            r = _composite_signal(sym)
+            if r and abs(r["score"]) >= 4:
+                key = "%s:%s" % (r["sym"], r["type"])
+                if key not in _notified_signals:
+                    _notified_signals.add(key); new.append(r)
+        except Exception:
+            pass
+    for r in new:
+        _tg_send("🔥 V3K Signal: %s is %s (score %+d) at %s" %
+                 (r["sym"].replace(".NS", ""), r["type"], r["score"], r["price"]))
+    # price alerts
+    alerts = _alerts_load(); changed = False
+    for a in alerts:
+        if a.get("done"):
+            continue
+        try:
+            p = float(yf.Ticker(a["sym"]).history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            continue
+        hit = None
+        if a.get("type") != "sell":
+            if a.get("target") and p >= a["target"]: hit = "🎯 Target reached"
+            elif a.get("stop") and p <= a["stop"]:   hit = "🛑 Support broken"
+        else:
+            if a.get("target") and p <= a["target"]: hit = "🎯 Target reached"
+            elif a.get("stop") and p >= a["stop"]:   hit = "🛑 Stop hit"
+        if hit:
+            a["done"] = True; changed = True
+            _tg_send("V3K Alert: %s %s at %.2f" % (a["sym"].replace(".NS", ""), hit, p), a.get("chat"))
+    if changed:
+        _alerts_save(alerts)
+    return {"scanned": len(syms), "new_signals": len(new), "market": "US" if us else "India"}
+
+@app.route("/cron/scan", methods=["GET", "POST"])
+def cron_scan():
+    try:
+        return jsonify(_run_scan())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/alerts/add", methods=["POST"])
+def alerts_add():
+    a = request.json or {}
+    if not a.get("sym"):
+        return jsonify({"error": "sym required"}), 400
+    alerts = _alerts_load()
+    alerts.append({"sym": a["sym"], "type": a.get("type", "buy"),
+                   "target": a.get("target"), "stop": a.get("stop"),
+                   "chat": a.get("chat"), "done": False})
+    _alerts_save(alerts)
+    return jsonify({"status": "ok", "count": len(alerts)})
+
+@app.route("/alerts/list", methods=["GET"])
+def alerts_list():
+    return jsonify({"alerts": _alerts_load()})
+
+@app.route("/alerts/clear", methods=["POST"])
+def alerts_clear():
+    _alerts_save([])
+    return jsonify({"status": "ok"})
+
+def _alert_loop():
+    # Runs while the instance is awake. On Render free tier, also ping /cron/scan
+    # from a free external scheduler (cron-job.org) every 15 min for true 24/7.
+    while True:
+        try:
+            _run_scan()
+        except Exception:
+            pass
+        time_module.sleep(900)
+
+try:
+    threading.Thread(target=_alert_loop, daemon=True).start()
+except Exception:
+    pass
