@@ -6171,19 +6171,19 @@ def _run_scan():
         hit_t = (p >= t["t1"]) if buy else (p <= t["t1"])
         hit_s = (p <= t["sl"]) if buy else (p >= t["sl"])
         if hit_t:
-            t["status"] = "target"
+            t["status"] = "target"; t["exit"] = round(p, 4)
             closed_msgs.append("🎯 Target hit: %s %s closed at %.2f (entry %.2f)." %
                                (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
         elif hit_s:
-            t["status"] = "stopped"
+            t["status"] = "stopped"; t["exit"] = round(p, 4)
             closed_msgs.append("🛑 Stop-loss: %s %s exited at %.2f (entry %.2f)." %
                                (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
 
     for m in opened_msgs + closed_msgs:
         _tg_send("V3K: " + m)
-    # keep open + last 20 closed
+    # keep open + a long history of closed trades (for the Reports tab)
     trades = [t for t in trades if t["status"] == "open"] + \
-             [t for t in trades if t["status"] != "open"][-20:]
+             [t for t in trades if t["status"] != "open"][-200:]
     _swings_save(trades)
 
     # price alerts
