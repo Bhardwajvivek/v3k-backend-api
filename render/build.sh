@@ -1,4 +1,3 @@
 #!/usr/bin/env bash
-pyenv install 3.10.13
-pyenv global 3.10.13
+# Render provides the Python version via runtime.txt — no pyenv needed.
 pip install -r requirements.txt
