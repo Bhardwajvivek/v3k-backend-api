@@ -6130,23 +6130,16 @@ def _run_scan():
     trades = _swings_load()
     opened_msgs, closed_msgs = [], []
 
-    # 1) SWING scan (daily) — new strong signals open swing trades (held overnight)
-    new = []
+    # 1) SWING scan (daily) — a new strong signal opens ONE swing trade.
+    # The single alert per stock comes from _open_or_check_trade (deduped by the
+    # persisted trades file, so it survives restarts and never re-sends).
     for sym in syms:
         try:
             r = _signal_tf(sym, "1y", "1d")
-            if not r:
-                continue
-            if abs(r["score"]) >= 4:
-                key = "%s:%s" % (r["sym"], r["type"])
-                if key not in _notified_signals:
-                    _notified_signals.add(key); new.append(r)
-            _open_or_check_trade(r, market, "swing", trades, opened_msgs, closed_msgs)
+            if r:
+                _open_or_check_trade(r, market, "swing", trades, opened_msgs, closed_msgs)
         except Exception:
             pass
-    for r in new:
-        _tg_send("🔥 V3K Swing Signal: %s is %s (score %+d) at %s" %
-                 (r["sym"].replace(".NS", ""), r["type"], r["score"], r["price"]))
 
     # 2) INTRADAY scan (15-min) — ONLY while a market is open; skipped after close
     if open_market:
@@ -6155,12 +6148,6 @@ def _run_scan():
             try:
                 r = _signal_tf(sym, "5d", "15m")
                 if r:
-                    if abs(r["score"]) >= 4:
-                        key = "INTRA:%s:%s" % (r["sym"], r["type"])
-                        if key not in _notified_signals:
-                            _notified_signals.add(key)
-                            _tg_send("⚡ V3K Intraday Signal: %s is %s (score %+d) at %s" %
-                                     (r["sym"].replace(".NS", ""), r["type"], r["score"], r["price"]))
                     _open_or_check_trade(r, open_market, "intraday", trades, opened_msgs, closed_msgs)
             except Exception:
                 pass
@@ -6221,7 +6208,7 @@ def _run_scan():
     if changed:
         _alerts_save(alerts)
     open_trades = len([t for t in trades if t["status"] == "open"])
-    return {"scanned": len(syms), "new_signals": len(new),
+    return {"scanned": len(syms), "new_signals": len(opened_msgs),
             "market": "US" if us else "India",
             "market_open": open_market or "closed",
             "intraday_active": bool(open_market),
