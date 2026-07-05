@@ -6243,6 +6243,44 @@ def alerts_clear():
     _alerts_save([])
     return jsonify({"status": "ok"})
 
+@app.route("/quotes", methods=["GET"])
+def quotes():
+    """Batch live quotes (price + % change) — reliable server-side, no CORS proxy.
+    /quotes?syms=GC=F,SI=F,BTC-USD  →  {"quotes":{"GC=F":{"price":...,"change":...}}}"""
+    syms = [s for s in (request.args.get("syms", "").split(",")) if s]
+    out = {}
+    for s in syms:
+        try:
+            h = yf.Ticker(s).history(period="5d")
+            if len(h) >= 1:
+                price = float(h["Close"].iloc[-1])
+                prev = float(h["Close"].iloc[-2]) if len(h) >= 2 else price
+                chg = ((price - prev) / prev * 100) if prev else 0.0
+                out[s] = {"price": round(price, 4), "change": round(chg, 2)}
+        except Exception:
+            pass
+    return jsonify({"quotes": out})
+
+@app.route("/history", methods=["GET"])
+def history():
+    """Server-side OHLCV history for signals / button colours (no CORS proxy)."""
+    sym = request.args.get("sym", "")
+    rng = request.args.get("range", "1y")
+    itv = request.args.get("interval", "1d")
+    try:
+        h = yf.Ticker(sym).history(period=rng, interval=itv)
+        if len(h) < 30:
+            return jsonify({"error": "no data"}), 404
+        return jsonify({
+            "close": [None if x != x else round(float(x), 4) for x in h["Close"]],
+            "high":  [None if x != x else round(float(x), 4) for x in h["High"]],
+            "low":   [None if x != x else round(float(x), 4) for x in h["Low"]],
+            "vol":   [0 if x != x else int(x) for x in h["Volume"]],
+            "price": round(float(h["Close"].iloc[-1]), 4),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/index-chart", methods=["GET"])
 def index_chart():
     """Server-side index/price history for the hero chart (no CORS proxy needed)."""
