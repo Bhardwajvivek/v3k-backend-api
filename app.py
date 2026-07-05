@@ -6256,6 +6256,21 @@ def alerts_clear():
     _alerts_save([])
     return jsonify({"status": "ok"})
 
+@app.route("/index-chart", methods=["GET"])
+def index_chart():
+    """Server-side index/price history for the hero chart (no CORS proxy needed)."""
+    sym = request.args.get("sym", "^NSEI")
+    rng = request.args.get("range", "6mo")
+    itv = request.args.get("interval", "1d")
+    try:
+        h = yf.Ticker(sym).history(period=rng, interval=itv)
+        closes = [round(float(x), 2) for x in h["Close"] if x == x]  # drop NaN
+        if len(closes) < 2:
+            return jsonify({"error": "no data"}), 404
+        return jsonify({"sym": sym, "closes": closes, "price": closes[-1]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/swings/list", methods=["GET"])
 def swings_list():
     t = _swings_load()
