@@ -6023,12 +6023,21 @@ def _rsi_last(c, n=14):
             out = 100 if al == 0 else 100 - 100 / (1 + ag / al)
     return out if out is not None else 50
 
-def _composite_signal(sym):
-    """Same multi-factor composite as the frontend, computed server-side."""
-    h = yf.Ticker(sym).history(period="1y", interval="1d")
+def _atr_last(hi, lo, c, n=14):
+    i = len(c) - 1
+    if i < n:
+        return None
+    s = 0.0
+    for k in range(i - n + 1, i + 1):
+        s += max(hi[k] - lo[k], abs(hi[k] - c[k - 1]), abs(lo[k] - c[k - 1]))
+    return s / n
+
+def _signal_tf(sym, period="1y", interval="1d"):
+    """Multi-factor composite (same as the frontend) on any timeframe. Returns ATR too."""
+    h = yf.Ticker(sym).history(period=period, interval=interval)
     if len(h) < 60:
         return None
-    c = list(h["Close"]); hi = list(h["High"])
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
     i = len(c) - 1
     e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
     e12 = _ema(c, 12); e26 = _ema(c, 26)
@@ -6047,32 +6056,143 @@ def _composite_signal(sym):
         elif 22 < rsi < 48: s -= 1
     s += 1 if price >= dh else -1
     typ = "BULLISH" if s >= 3 else ("BEARISH" if s <= -3 else "NEUTRAL")
-    return {"sym": sym, "score": s, "type": typ, "price": round(price, 2)}
+    atr = _atr_last(hi, lo, c) or price * 0.02
+    return {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr}
+
+def _composite_signal(sym):
+    """Daily composite (kept for backward compatibility)."""
+    return _signal_tf(sym, "1y", "1d")
+
+# ── Server-side swing / intraday trade tracking (always-on, no client needed) ──
+_SWINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v3k_swings.json")
+
+def _swings_load():
+    try:
+        with open(_SWINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _swings_save(s):
+    try:
+        with open(_SWINGS_FILE, "w") as f:
+            json.dump(s, f)
+    except Exception:
+        pass
+
+def _market_open_now():
+    """Returns 'india', 'us', or None based on IST clock + weekday."""
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    istmin = (now.hour * 60 + now.minute + 330) % 1440
+    # IST weekday (0=Mon..6=Sun after +5:30 shift)
+    wd = (now.weekday() if istmin >= (now.hour * 60 + now.minute) else (now.weekday() + 1) % 7)
+    dow = now.weekday()  # UTC weekday is close enough for weekend gating
+    if dow >= 5:
+        return None
+    if 555 <= istmin <= 930:            # 09:15–15:30 IST
+        return "india"
+    if istmin >= 1140 or istmin <= 90:  # ~19:00–01:30 IST = US session
+        return "us"
+    return None
+
+def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
+    """Open a new trade for a fresh strong signal, or leave existing ones to the monitor."""
+    thresh = 4 if kind == "intraday" else 3
+    if abs(r["score"]) < thresh or r["type"] == "NEUTRAL":
+        return
+    if any(t for t in trades if t["status"] == "open" and t["sym"] == r["sym"]
+           and t["market"] == market and t["kind"] == kind):
+        return
+    side = "buy" if r["score"] > 0 else "sell"
+    d = 1 if side == "buy" else -1
+    mult = 1.0 if kind == "intraday" else 1.5
+    entry = r["price"]; atr = r["atr"]
+    t1 = round(entry + d * mult * atr, 2); sl = round(entry - d * mult * atr, 2)
+    trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
+                   "entry": entry, "t1": t1, "sl": sl, "status": "open"})
+    opened_msgs.append("📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" %
+                       (kind.title(), side.upper(), r["sym"].replace(".NS", ""), entry, t1, sl))
 
 _WATCH_IN = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS",
              "TATAMOTORS.NS","BHARTIARTL.NS","LT.NS","AXISBANK.NS","MARUTI.NS","SUNPHARMA.NS"]
 _WATCH_US = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","JPM","NFLX","AVGO","QCOM"]
 
 def _run_scan():
-    """One scan cycle: new strong signals + price-alert checks → Telegram."""
+    """One scan cycle: swing + intraday trade tracking + price alerts → Telegram."""
     from datetime import timezone
     now = datetime.now(timezone.utc)
     istmin = (now.hour * 60 + now.minute + 330) % 1440
     us = (istmin >= 1140 or istmin <= 90)
+    market = "us" if us else "india"
     syms = _WATCH_US if us else _WATCH_IN
+    open_market = _market_open_now()   # 'india' | 'us' | None
+    trades = _swings_load()
+    opened_msgs, closed_msgs = [], []
+
+    # 1) SWING scan (daily) — new strong signals open swing trades (held overnight)
     new = []
     for sym in syms:
         try:
-            r = _composite_signal(sym)
-            if r and abs(r["score"]) >= 4:
+            r = _signal_tf(sym, "1y", "1d")
+            if not r:
+                continue
+            if abs(r["score"]) >= 4:
                 key = "%s:%s" % (r["sym"], r["type"])
                 if key not in _notified_signals:
                     _notified_signals.add(key); new.append(r)
+            _open_or_check_trade(r, market, "swing", trades, opened_msgs, closed_msgs)
         except Exception:
             pass
     for r in new:
-        _tg_send("🔥 V3K Signal: %s is %s (score %+d) at %s" %
+        _tg_send("🔥 V3K Swing Signal: %s is %s (score %+d) at %s" %
                  (r["sym"].replace(".NS", ""), r["type"], r["score"], r["price"]))
+
+    # 2) INTRADAY scan (15-min) — ONLY while a market is open; skipped after close
+    if open_market:
+        intraday_syms = _WATCH_US if open_market == "us" else _WATCH_IN
+        for sym in intraday_syms:
+            try:
+                r = _signal_tf(sym, "5d", "15m")
+                if r:
+                    _open_or_check_trade(r, open_market, "intraday", trades, opened_msgs, closed_msgs)
+            except Exception:
+                pass
+    else:
+        # Market shut → square off any open intraday trades (never held overnight)
+        for t in trades:
+            if t["status"] == "open" and t["kind"] == "intraday":
+                t["status"] = "session-end"
+                closed_msgs.append("🔔 Intraday auto-exit: %s squared off at market close." %
+                                   t["sym"].replace(".NS", ""))
+
+    # 3) MONITOR all open trades for 🎯 target / 🛑 stop-loss
+    for t in trades:
+        if t["status"] != "open":
+            continue
+        try:
+            p = float(yf.Ticker(t["sym"]).history(period="1d")["Close"].iloc[-1])
+        except Exception:
+            continue
+        buy = t["side"] == "buy"
+        hit_t = (p >= t["t1"]) if buy else (p <= t["t1"])
+        hit_s = (p <= t["sl"]) if buy else (p >= t["sl"])
+        if hit_t:
+            t["status"] = "target"
+            closed_msgs.append("🎯 Target hit: %s %s closed at %.2f (entry %.2f)." %
+                               (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
+        elif hit_s:
+            t["status"] = "stopped"
+            closed_msgs.append("🛑 Stop-loss: %s %s exited at %.2f (entry %.2f)." %
+                               (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
+
+    for m in opened_msgs + closed_msgs:
+        _tg_send("V3K: " + m)
+    # keep open + last 20 closed
+    trades = [t for t in trades if t["status"] == "open"] + \
+             [t for t in trades if t["status"] != "open"][-20:]
+    _swings_save(trades)
+
     # price alerts
     alerts = _alerts_load(); changed = False
     for a in alerts:
@@ -6094,7 +6214,13 @@ def _run_scan():
             _tg_send("V3K Alert: %s %s at %.2f" % (a["sym"].replace(".NS", ""), hit, p), a.get("chat"))
     if changed:
         _alerts_save(alerts)
-    return {"scanned": len(syms), "new_signals": len(new), "market": "US" if us else "India"}
+    open_trades = len([t for t in trades if t["status"] == "open"])
+    return {"scanned": len(syms), "new_signals": len(new),
+            "market": "US" if us else "India",
+            "market_open": open_market or "closed",
+            "intraday_active": bool(open_market),
+            "open_trades": open_trades,
+            "events": opened_msgs + closed_msgs}
 
 @app.route("/cron/scan", methods=["GET", "POST"])
 def cron_scan():
@@ -6123,6 +6249,12 @@ def alerts_list():
 def alerts_clear():
     _alerts_save([])
     return jsonify({"status": "ok"})
+
+@app.route("/swings/list", methods=["GET"])
+def swings_list():
+    t = _swings_load()
+    return jsonify({"open": [x for x in t if x["status"] == "open"],
+                    "closed": [x for x in t if x["status"] != "open"]})
 
 def _alert_loop():
     # Runs while the instance is awake. On Render free tier, also ping /cron/scan
