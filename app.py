@@ -6155,6 +6155,12 @@ def _run_scan():
             try:
                 r = _signal_tf(sym, "5d", "15m")
                 if r:
+                    if abs(r["score"]) >= 4:
+                        key = "INTRA:%s:%s" % (r["sym"], r["type"])
+                        if key not in _notified_signals:
+                            _notified_signals.add(key)
+                            _tg_send("⚡ V3K Intraday Signal: %s is %s (score %+d) at %s" %
+                                     (r["sym"].replace(".NS", ""), r["type"], r["score"], r["price"]))
                     _open_or_check_trade(r, open_market, "intraday", trades, opened_msgs, closed_msgs)
             except Exception:
                 pass
