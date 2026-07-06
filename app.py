@@ -6037,7 +6037,7 @@ def _signal_tf(sym, period="1y", interval="1d"):
     h = yf.Ticker(sym).history(period=period, interval=interval)
     if len(h) < 60:
         return None
-    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
     i = len(c) - 1
     e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
     e12 = _ema(c, 12); e26 = _ema(c, 26)
@@ -6057,11 +6057,159 @@ def _signal_tf(sym, period="1y", interval="1d"):
     s += 1 if price >= dh else -1
     typ = "BULLISH" if s >= 3 else ("BEARISH" if s <= -3 else "NEUTRAL")
     atr = _atr_last(hi, lo, c) or price * 0.02
-    return {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr}
+    # ML win-probability for this setup (real trained model; None until trained)
+    ml = None
+    try:
+        dr = 1 if s >= 0 else -1
+        ml = _ml_prob(_feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr))
+    except Exception:
+        ml = None
+    out = {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr}
+    if ml is not None:
+        out["ml_prob"] = round(ml, 3); out["conf"] = round(ml * 100)
+    return out
 
 def _composite_signal(sym):
     """Daily composite (kept for backward compatibility)."""
     return _signal_tf(sym, "1y", "1d")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MACHINE-LEARNING LAYER  —  a real trained classifier that predicts the
+#  probability a signal reaches its target (+1.5 ATR) before its stop (-1.5 ATR)
+#  within 10 trading days. Trained on 2 years of history for the watchlist,
+#  validated out-of-sample (train on earlier bars, test on later). This turns
+#  the "AI confidence" into a genuine model output, not a hand-tuned number.
+# ══════════════════════════════════════════════════════════════════════════════
+_FEATURES = ["ema20_50","ema50_200","px_ema20","macd_hist","rsi","atr_pct",
+             "breakout","vol_ratio","mom10","mom20"]
+_MODEL = {"ready": False}
+_ML_HORIZON = 10
+_ML_ATR = 1.5
+
+def _rsi_series(c, n=14):
+    out=[None]*len(c); ag=al=0.0
+    for i in range(1,len(c)):
+        d=(c[i] or c[i-1])-(c[i-1] or c[i]); g=max(d,0.0); l=max(-d,0.0)
+        if i<=n:
+            ag+=g; al+=l
+            if i==n: ag/=n; al/=n; out[i]=100.0 if al==0 else 100-100/(1+ag/al)
+        else:
+            ag=(ag*(n-1)+g)/n; al=(al*(n-1)+l)/n
+            out[i]=100.0 if al==0 else 100-100/(1+ag/al)
+    return out
+
+def _sma_at(v, n, i):
+    if i+1 < n: return None
+    s=0.0; c=0
+    for k in range(i-n+1, i+1):
+        if v[k] is not None and v[k]==v[k]: s+=v[k]; c+=1
+    return (s/c) if c else None
+
+def _atr_at(hi, lo, c, i, n=14):
+    if i < n: return None
+    s=0.0
+    for k in range(i-n+1, i+1):
+        s+=max(hi[k]-lo[k], abs(hi[k]-c[k-1]), abs(lo[k]-c[k-1]))
+    return s/n
+
+def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr):
+    price=c[i]
+    f=[]
+    f.append(((e20[i]-e50[i])/e50[i])*dr if (e20[i] and e50[i]) else 0.0)
+    f.append(((e50[i]-e200[i])/e200[i])*dr if (e50[i] and e200[i]) else 0.0)
+    f.append((price/e20[i]-1)*dr if e20[i] else 0.0)
+    hist=(macd[i] or 0)-(sig[i] or 0)
+    f.append((hist/price)*dr if price else 0.0)
+    f.append((rsiS[i] or 50)/100.0)
+    atr=_atr_at(hi,lo,c,i) or price*0.02
+    f.append(atr/price if price else 0.0)
+    dh=max(hi[i-20:i]) if i>=20 else hi[i]
+    f.append(((price-dh)/price)*dr if price else 0.0)
+    sv=_sma_at(vol,20,i)
+    f.append((vol[i]/sv-1) if (sv and vol[i]) else 0.0)
+    f.append((price/c[i-10]-1)*dr if (i>=10 and c[i-10]) else 0.0)
+    f.append((price/c[i-20]-1)*dr if (i>=20 and c[i-20]) else 0.0)
+    return f
+
+def _signal_samples(sym):
+    """Build (features, win/loss) samples from 2y history for every signal bar."""
+    h = yf.Ticker(sym).history(period="2y", interval="1d")
+    if len(h) < 160: return [], []
+    c=list(h["Close"]); hi=list(h["High"]); lo=list(h["Low"]); vol=list(h["Volume"])
+    e20=_ema(c,20); e50=_ema(c,50); e200=_ema(c,200); e12=_ema(c,12); e26=_ema(c,26)
+    macd=[(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
+    sig=_ema([0 if x is None else x for x in macd],9)
+    rsiS=_rsi_series(c)
+    X=[]; Y=[]; H=_ML_HORIZON; M=_ML_ATR
+    for i in range(200, len(c)-H):
+        price=c[i]; s=0
+        if e20[i] and e50[i]:  s+= 1 if e20[i]>e50[i] else -1
+        if e50[i] and e200[i]: s+= 1 if e50[i]>e200[i] else -1
+        if e20[i]:             s+= 1 if price>e20[i] else -1
+        hist=(macd[i] or 0)-(sig[i] or 0); s+= 1 if hist>0 else -1
+        rv=rsiS[i]
+        if rv is not None:
+            if 52<rv<78: s+=1
+            elif 22<rv<48: s-=1
+        dh=max(hi[i-20:i]); s+= 1 if price>=dh else -1
+        if abs(s) < 3: continue
+        dr = 1 if s>0 else -1
+        atr=_atr_at(hi,lo,c,i) or price*0.02
+        tgt=price+dr*M*atr; stp=price-dr*M*atr
+        label=0
+        for k in range(i+1, i+1+H):
+            if dr>0:
+                if hi[k]>=tgt: label=1; break
+                if lo[k]<=stp: label=0; break
+            else:
+                if lo[k]<=tgt: label=1; break
+                if hi[k]>=stp: label=0; break
+        X.append(_feat_vec(c,hi,lo,vol,e20,e50,e200,macd,sig,rsiS,i,dr)); Y.append(label)
+    return X, Y
+
+def _train_model():
+    """Train + out-of-sample validate the win-probability model. Stores it in _MODEL."""
+    global _MODEL
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import roc_auc_score, accuracy_score
+    except Exception as e:
+        _MODEL = {"ready": False, "error": "sklearn unavailable: %s" % e}; return _MODEL
+    Xtr=[]; Ytr=[]; Xte=[]; Yte=[]
+    for sym in (_WATCH_IN + _WATCH_US):
+        try:
+            x,y=_signal_samples(sym)
+            if len(x) < 20: continue
+            cut=int(len(x)*0.8)
+            Xtr+=x[:cut]; Ytr+=y[:cut]; Xte+=x[cut:]; Yte+=y[cut:]
+        except Exception:
+            pass
+    if len(Xtr) < 150 or len(set(Ytr)) < 2 or len(Xte) < 30:
+        _MODEL = {"ready": False, "error": "insufficient data", "n_train": len(Xtr), "n_test": len(Xte)}
+        return _MODEL
+    Xtr_a=np.array(Xtr); Xte_a=np.array(Xte); Ytr_a=np.array(Ytr); Yte_a=np.array(Yte)
+    sc=StandardScaler().fit(Xtr_a)
+    clf=LogisticRegression(max_iter=1000, class_weight="balanced").fit(sc.transform(Xtr_a), Ytr_a)
+    prob=clf.predict_proba(sc.transform(Xte_a))[:,1]
+    pred=(prob>=0.5).astype(int)
+    try: auc=round(float(roc_auc_score(Yte_a, prob)), 3)
+    except Exception: auc=None
+    _MODEL = {"ready": True, "clf": clf, "scaler": sc,
+              "acc": round(float(accuracy_score(Yte_a, pred)), 3), "auc": auc,
+              "base_rate": round(float(np.mean(np.concatenate([Ytr_a, Yte_a]))), 3),
+              "n_train": len(Xtr), "n_test": len(Xte), "features": _FEATURES,
+              "importance": {_FEATURES[i]: round(float(clf.coef_[0][i]), 3) for i in range(len(_FEATURES))},
+              "trained_at": datetime.utcnow().isoformat()}
+    return _MODEL
+
+def _ml_prob(feat):
+    m=_MODEL
+    if not m.get("ready"): return None
+    try:
+        return float(m["clf"].predict_proba(m["scaler"].transform(np.array([feat])))[0,1])
+    except Exception:
+        return None
 
 # ── Server-side swing / intraday trade tracking (always-on, no client needed) ──
 _SWINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v3k_swings.json")
@@ -6302,6 +6450,37 @@ def swings_list():
     return jsonify({"open": [x for x in t if x["status"] == "open"],
                     "closed": [x for x in t if x["status"] != "open"]})
 
+@app.route("/model/stats", methods=["GET"])
+def model_stats():
+    """Honest performance of the ML model: out-of-sample accuracy, AUC, size, weights."""
+    m = _MODEL
+    if not m.get("ready"):
+        return jsonify({"ready": False, "error": m.get("error", "training"), "n_train": m.get("n_train", 0)})
+    return jsonify({k: m[k] for k in ("ready","acc","auc","base_rate","n_train","n_test","features","importance","trained_at")})
+
+@app.route("/model/train", methods=["POST", "GET"])
+def model_train():
+    """Retrain the model on the latest 2y of history (also runs in the background at startup)."""
+    m = _train_model()
+    return jsonify({"ready": m.get("ready"), "acc": m.get("acc"), "auc": m.get("auc"),
+                    "n_train": m.get("n_train"), "n_test": m.get("n_test"), "error": m.get("error")})
+
+@app.route("/signals", methods=["GET"])
+def signals():
+    """Live watchlist signals WITH the ML win-probability (conf) for the app."""
+    mkt = request.args.get("market", "india")
+    syms = _WATCH_US if mkt == "us" else _WATCH_IN
+    out = []
+    for sym in syms:
+        try:
+            r = _signal_tf(sym, "1y", "1d")
+            if r and abs(r["score"]) >= 3:
+                out.append(r)
+        except Exception:
+            pass
+    out.sort(key=lambda x: (abs(x["score"]), x.get("ml_prob", 0)), reverse=True)
+    return jsonify({"market": mkt, "model_ready": _MODEL.get("ready", False), "signals": out})
+
 def _alert_loop():
     # Runs while the instance is awake. On Render free tier, also ping /cron/scan
     # from a free external scheduler (cron-job.org) every 15 min for true 24/7.
@@ -6314,5 +6493,18 @@ def _alert_loop():
 
 try:
     threading.Thread(target=_alert_loop, daemon=True).start()
+except Exception:
+    pass
+
+# Train the ML model in the background at startup (non-blocking). The app serves
+# signals with the heuristic confidence until the model is ready, then uses it.
+def _model_bootstrap():
+    try:
+        _train_model()
+    except Exception:
+        pass
+
+try:
+    threading.Thread(target=_model_bootstrap, daemon=True).start()
 except Exception:
     pass
