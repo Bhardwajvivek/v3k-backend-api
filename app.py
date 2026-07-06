@@ -6064,7 +6064,9 @@ def _signal_tf(sym, period="1y", interval="1d"):
         ml = _ml_prob(_feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr))
     except Exception:
         ml = None
-    out = {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr}
+    # trend alignment (price vs EMA200) — used by high-conviction filtering
+    trend_ok = (e200[i] is not None) and ((s >= 0 and price > e200[i]) or (s < 0 and price < e200[i]))
+    out = {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr, "trend_ok": bool(trend_ok)}
     if ml is not None:
         out["ml_prob"] = round(ml, 3); out["conf"] = round(ml * 100)
     return out
@@ -6263,18 +6265,19 @@ def _market_open_now():
     return None
 
 def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
-    """Open a new trade for a fresh strong signal, or leave existing ones to the monitor."""
-    thresh = 4 if kind == "intraday" else 3
-    if abs(r["score"]) < thresh or r["type"] == "NEUTRAL":
+    """Open ONLY high-conviction, trend-aligned signals (score 6, max) with the profitable
+    tight-target (0.75 ATR) / wide-stop (2.0 ATR) profile — fewer, higher win-rate trades."""
+    if abs(r["score"]) < 6 or r["type"] == "NEUTRAL":
+        return
+    if not r.get("trend_ok", False):     # must trade with the long-term (EMA200) trend
         return
     if any(t for t in trades if t["status"] == "open" and t["sym"] == r["sym"]
            and t["market"] == market and t["kind"] == kind):
         return
     side = "buy" if r["score"] > 0 else "sell"
     d = 1 if side == "buy" else -1
-    mult = 1.0 if kind == "intraday" else 1.5
     entry = r["price"]; atr = r["atr"]
-    t1 = round(entry + d * mult * atr, 2); sl = round(entry - d * mult * atr, 2)
+    t1 = round(entry + d * 0.75 * atr, 2); sl = round(entry - d * 2.0 * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
                    "entry": entry, "t1": t1, "sl": sl, "status": "open"})
     opened_msgs.append("📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" %
