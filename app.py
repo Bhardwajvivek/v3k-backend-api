@@ -6188,7 +6188,7 @@ def _train_model():
     """Train + out-of-sample validate the win-probability model. Stores it in _MODEL."""
     global _MODEL
     try:
-        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import roc_auc_score, accuracy_score
     except Exception as e:
@@ -6207,13 +6207,12 @@ def _train_model():
         return _MODEL
     Xtr_a=np.array(Xtr); Xte_a=np.array(Xte); Ytr_a=np.array(Ytr); Yte_a=np.array(Yte)
     sc=StandardScaler().fit(Xtr_a)
-    clf=GradientBoostingClassifier(n_estimators=180, max_depth=3, learning_rate=0.05,
-                                   subsample=0.85, random_state=42).fit(sc.transform(Xtr_a), Ytr_a)
+    clf=LogisticRegression(max_iter=1000, class_weight="balanced").fit(sc.transform(Xtr_a), Ytr_a)
     prob=clf.predict_proba(sc.transform(Xte_a))[:,1]
     pred=(prob>=0.5).astype(int)
     try: auc=round(float(roc_auc_score(Yte_a, prob)), 3)
     except Exception: auc=None
-    imp=clf.feature_importances_
+    imp=clf.coef_[0]
     _MODEL = {"ready": True, "clf": clf, "scaler": sc,
               "acc": round(float(accuracy_score(Yte_a, pred)), 3), "auc": auc,
               "base_rate": round(float(np.mean(np.concatenate([Ytr_a, Yte_a]))), 3),
