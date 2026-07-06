@@ -6081,7 +6081,8 @@ def _composite_signal(sym):
 #  the "AI confidence" into a genuine model output, not a hand-tuned number.
 # ══════════════════════════════════════════════════════════════════════════════
 _FEATURES = ["ema20_50","ema50_200","px_ema20","macd_hist","rsi","atr_pct",
-             "breakout","vol_ratio","mom10","mom20"]
+             "breakout","vol_ratio","mom10","mom20",
+             "dist_52w_hi","dist_52w_lo","up_ratio10","atr_regime"]
 _MODEL = {"ready": False}
 _ML_HORIZON = 10
 _ML_ATR = 1.5
@@ -6129,6 +6130,22 @@ def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr):
     f.append((vol[i]/sv-1) if (sv and vol[i]) else 0.0)
     f.append((price/c[i-10]-1)*dr if (i>=10 and c[i-10]) else 0.0)
     f.append((price/c[i-20]-1)*dr if (i>=20 and c[i-20]) else 0.0)
+    # distance from 52-week high / low (momentum vs mean-reversion context)
+    lb = 252 if i >= 252 else i
+    hh = max(hi[i-lb:i]) if lb > 0 else price
+    ll = min(lo[i-lb:i]) if lb > 0 else price
+    f.append((price-hh)/price if price else 0.0)
+    f.append((price-ll)/price if price else 0.0)
+    # fraction of up-days in the last 10 bars (trend consistency)
+    up = sum(1 for k in range(max(1,i-9), i+1) if c[k] > c[k-1])
+    f.append(up/10.0)
+    # volatility regime: current ATR vs 60-bar average ATR
+    a_now = _atr_at(hi,lo,c,i) or 0.0
+    a_avg = 0.0; cnt = 0
+    for k in range(max(15, i-59), i+1):
+        av = _atr_at(hi,lo,c,k)
+        if av: a_avg += av; cnt += 1
+    f.append((a_now/(a_avg/cnt)) if (cnt and a_avg) else 1.0)
     return f
 
 def _signal_samples(sym):
@@ -6171,7 +6188,7 @@ def _train_model():
     """Train + out-of-sample validate the win-probability model. Stores it in _MODEL."""
     global _MODEL
     try:
-        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import GradientBoostingClassifier
         from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import roc_auc_score, accuracy_score
     except Exception as e:
@@ -6190,16 +6207,18 @@ def _train_model():
         return _MODEL
     Xtr_a=np.array(Xtr); Xte_a=np.array(Xte); Ytr_a=np.array(Ytr); Yte_a=np.array(Yte)
     sc=StandardScaler().fit(Xtr_a)
-    clf=LogisticRegression(max_iter=1000, class_weight="balanced").fit(sc.transform(Xtr_a), Ytr_a)
+    clf=GradientBoostingClassifier(n_estimators=180, max_depth=3, learning_rate=0.05,
+                                   subsample=0.85, random_state=42).fit(sc.transform(Xtr_a), Ytr_a)
     prob=clf.predict_proba(sc.transform(Xte_a))[:,1]
     pred=(prob>=0.5).astype(int)
     try: auc=round(float(roc_auc_score(Yte_a, prob)), 3)
     except Exception: auc=None
+    imp=clf.feature_importances_
     _MODEL = {"ready": True, "clf": clf, "scaler": sc,
               "acc": round(float(accuracy_score(Yte_a, pred)), 3), "auc": auc,
               "base_rate": round(float(np.mean(np.concatenate([Ytr_a, Yte_a]))), 3),
               "n_train": len(Xtr), "n_test": len(Xte), "features": _FEATURES,
-              "importance": {_FEATURES[i]: round(float(clf.coef_[0][i]), 3) for i in range(len(_FEATURES))},
+              "importance": {_FEATURES[i]: round(float(imp[i]), 3) for i in range(len(_FEATURES))},
               "trained_at": datetime.utcnow().isoformat()}
     return _MODEL
 
