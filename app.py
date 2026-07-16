@@ -5987,19 +5987,70 @@ def _tg_send(text, chat=None):
     except Exception:
         pass
 
-def _alerts_load():
+# ── Persistent storage: Upstash Redis (free) via REST if configured, else local file.
+# Render's free disk is EPHEMERAL — wiped on every restart/redeploy — which erased open
+# trades before they could hit target/SL (no exit alerts) and emptied the report. When the
+# two Upstash env vars are set, state persists forever across restarts.
+_UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+_UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+# kvdb.io bucket (owner's, created under bhardwajvivek.v3@gmail.com). Free persistent JSON
+# store — works once the owner clicks the kvdb verification email. Override via env if needed.
+_KVDB_BUCKET = os.environ.get("KVDB_BUCKET", "EJPanNCNcXa88zUcE8gHrV")
+
+def _kv_file(key):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), key + ".json")
+
+def _storage_kind():
+    if _UPSTASH_URL and _UPSTASH_TOKEN: return "upstash"
+    if _KVDB_BUCKET: return "kvdb"
+    return "local(ephemeral)"
+
+def _kv_get(key, default):
+    if _UPSTASH_URL and _UPSTASH_TOKEN:
+        try:
+            r = requests.get("%s/get/%s" % (_UPSTASH_URL, key),
+                             headers={"Authorization": "Bearer %s" % _UPSTASH_TOKEN}, timeout=12)
+            v = r.json().get("result")
+            return json.loads(v) if v else default
+        except Exception:
+            return default
+    if _KVDB_BUCKET:
+        try:
+            r = requests.get("https://kvdb.io/%s/%s" % (_KVDB_BUCKET, key), timeout=12)
+            if r.status_code == 200 and r.text.strip():
+                return json.loads(r.text)
+            return default
+        except Exception:
+            return default
     try:
-        with open(_ALERTS_FILE) as f:
+        with open(_kv_file(key)) as f:
             return json.load(f)
     except Exception:
-        return []
+        return default
 
-def _alerts_save(a):
+def _kv_set(key, value):
+    data = json.dumps(value)
+    if _UPSTASH_URL and _UPSTASH_TOKEN:
+        try:
+            requests.post("%s/set/%s" % (_UPSTASH_URL, key), data=data.encode("utf-8"),
+                          headers={"Authorization": "Bearer %s" % _UPSTASH_TOKEN}, timeout=12)
+            return
+        except Exception:
+            pass
+    if _KVDB_BUCKET:
+        try:
+            requests.put("https://kvdb.io/%s/%s" % (_KVDB_BUCKET, key), data=data.encode("utf-8"), timeout=12)
+            return
+        except Exception:
+            pass
     try:
-        with open(_ALERTS_FILE, "w") as f:
-            json.dump(a, f)
+        with open(_kv_file(key), "w") as f:
+            f.write(data)
     except Exception:
         pass
+
+def _alerts_load(): return _kv_get("v3k_alerts", [])
+def _alerts_save(a): _kv_set("v3k_alerts", a)
 
 def _ema(vals, n):
     out = [None] * len(vals); k = 2.0 / (n + 1); prev = None
@@ -6234,19 +6285,8 @@ def _ml_prob(feat):
 # ── Server-side swing / intraday trade tracking (always-on, no client needed) ──
 _SWINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v3k_swings.json")
 
-def _swings_load():
-    try:
-        with open(_SWINGS_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def _swings_save(s):
-    try:
-        with open(_SWINGS_FILE, "w") as f:
-            json.dump(s, f)
-    except Exception:
-        pass
+def _swings_load(): return _kv_get("v3k_swings", [])
+def _swings_save(s): _kv_set("v3k_swings", s)
 
 def _market_open_now():
     """Returns 'india', 'us', or None based on IST clock + weekday."""
@@ -6339,14 +6379,15 @@ def _run_scan():
         buy = t["side"] == "buy"
         hit_t = (p >= t["t1"]) if buy else (p <= t["t1"])
         hit_s = (p <= t["sl"]) if buy else (p >= t["sl"])
+        pnl = ((p - t["entry"]) / t["entry"] * 100) if buy else ((t["entry"] - p) / t["entry"] * 100)
         if hit_t:
             t["status"] = "target"; t["exit"] = round(p, 4)
-            closed_msgs.append("🎯 Target hit: %s %s closed at %.2f (entry %.2f)." %
-                               (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
+            closed_msgs.append("🎯 TARGET HIT — %s %s (%s): booked %+.2f%%  ·  entry %.2f → exit %.2f  ✅ WIN" %
+                               (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
         elif hit_s:
             t["status"] = "stopped"; t["exit"] = round(p, 4)
-            closed_msgs.append("🛑 Stop-loss: %s %s exited at %.2f (entry %.2f)." %
-                               (t["kind"], t["sym"].replace(".NS", ""), p, t["entry"]))
+            closed_msgs.append("🛑 STOP-LOSS HIT — %s %s (%s): %+.2f%%  ·  entry %.2f → exit %.2f  ❌ LOSS" %
+                               (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
 
     for m in opened_msgs + closed_msgs:
         _tg_send("V3K: " + m)
@@ -6381,7 +6422,7 @@ def _run_scan():
             "market": "US" if us else "India",
             "market_open": open_market or "closed",
             "intraday_active": bool(open_market),
-            "open_trades": open_trades,
+            "open_trades": open_trades, "storage": _storage_kind(),
             "events": opened_msgs + closed_msgs}
 
 @app.route("/cron/scan", methods=["GET", "POST"])
