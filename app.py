@@ -6320,8 +6320,12 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     t1 = round(entry + d * 0.75 * atr, 2); sl = round(entry - d * 2.0 * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
                    "entry": entry, "t1": t1, "sl": sl, "status": "open"})
-    opened_msgs.append("📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" %
-                       (kind.title(), side.upper(), r["sym"].replace(".NS", ""), entry, t1, sl))
+    clean_sym = r["sym"].replace(".NS", "")
+    msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" % (kind.title(), side.upper(), clean_sym, entry, t1, sl)
+    # One-tap semi-auto: India trades get a Zerodha order link (user reviews & confirms in Kite)
+    if market == "india":
+        msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:%s" % (clean_sym, side.upper())
+    opened_msgs.append(msg)
 
 _WATCH_IN = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS",
              "TATAMOTORS.NS","BHARTIARTL.NS","LT.NS","AXISBANK.NS","MARUTI.NS","SUNPHARMA.NS"]
