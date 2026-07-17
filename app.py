@@ -2929,6 +2929,12 @@ def send_welcome():
         return jsonify({"sent": False, "error": str(e)}), 200
 
 
+@app.route("/market-regime", methods=["GET"])
+def market_regime():
+    """Index regime vs its 200-DMA. ?market=india|us → {regime, index, price, ema200, pct, allow_buy, allow_sell, label}."""
+    return jsonify(_market_regime((request.args.get("market") or "india").lower())), 200
+
+
 @app.route("/ai-selftest", methods=["GET"])
 def ai_selftest():
     """Diagnose the Claude wiring WITHOUT exposing the key. Reports whether the key is
@@ -6585,6 +6591,46 @@ def _market_open_now():
         return "us"
     return None
 
+# ── Market regime (index vs its 200-day EMA) ─────────────────────────────────
+# Risk-ON when the benchmark index is above its 200-DMA → favour longs; risk-OFF
+# when below → avoid new longs (this is the single biggest filter for equity edge).
+_REGIME_CACHE = {}          # market -> (ts, dict)
+_REGIME_TTL   = 3600        # 1 h — the 200-DMA regime barely moves intraday
+_INDEX_SYM  = {"india": "^NSEI", "us": "^GSPC"}
+_INDEX_NAME = {"india": "NIFTY 50", "us": "S&P 500"}
+
+def _market_regime(market):
+    market = "us" if market == "us" else "india"
+    now = time_module.time()
+    c0 = _REGIME_CACHE.get(market)
+    if c0 and now - c0[0] < _REGIME_TTL:
+        return c0[1]
+    out = {"market": market, "index": _INDEX_NAME[market], "regime": "unknown",
+           "price": None, "ema200": None, "pct": None, "allow_buy": True, "allow_sell": True,
+           "label": "Regime unavailable"}
+    try:
+        h = yf.Ticker(_INDEX_SYM[market]).history(period="2y", interval="1d")
+        c = [x for x in list(h["Close"]) if x is not None]
+        if len(c) >= 200:
+            e200 = _ema(c, 200)
+            price, ema = c[-1], e200[-1]
+            if ema:
+                pct = (price - ema) / ema * 100.0
+                risk_on = price >= ema
+                out.update({
+                    "regime": "risk_on" if risk_on else "risk_off",
+                    "price": round(price, 2), "ema200": round(ema, 2), "pct": round(pct, 2),
+                    "allow_buy": bool(risk_on), "allow_sell": bool(not risk_on),
+                    "label": "%s %s its 200-DMA (%+.1f%%) — %s" % (
+                        _INDEX_NAME[market], "above" if risk_on else "below", pct,
+                        "risk-ON, favour longs" if risk_on else "risk-OFF, avoid new longs"),
+                })
+    except Exception as e:
+        try: logging.warning("regime failed: %s", e)
+        except Exception: pass
+    _REGIME_CACHE[market] = (now, out)
+    return out
+
 def _news_sentiment_one(sym_clean, market):
     """Cached single-ticker news sentiment (same store as /news-sentiment)."""
     key = market + ":" + sym_clean
@@ -6616,6 +6662,17 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
         return
     side = "buy" if r["score"] > 0 else "sell"
     clean_sym = r["sym"].replace(".NS", "")
+    # ── Market-regime gate: trade WITH the index (long-only above 200-DMA, short-only below) ──
+    reg = {}
+    try:
+        reg = _market_regime(market) or {}
+    except Exception:
+        reg = {}
+    if reg.get("regime") in ("risk_on", "risk_off"):
+        if side == "buy" and not reg.get("allow_buy", True):
+            return   # risk-OFF market — don't open new longs
+        if side == "sell" and not reg.get("allow_sell", True):
+            return   # risk-ON market — don't short the uptrend
     # ── AI news-sentiment gate + alert context ──
     news = {}
     try:
@@ -6636,6 +6693,8 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     reason = (news.get("reason") or "").strip()
     msg += "\n%s News: %s (%+.2f)%s" % (emoji, nlabel, nscore, (" — " + reason) if reason else "")
     msg += " · %s" % tag
+    if reg.get("regime") in ("risk_on", "risk_off"):
+        msg += "\n🧭 %s" % reg.get("label", "")
     # One-tap semi-auto: India trades get a Zerodha order link (user reviews & confirms in Kite)
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:%s" % (clean_sym, side.upper())
