@@ -6562,9 +6562,28 @@ def _market_open_now():
         return "us"
     return None
 
+def _news_sentiment_one(sym_clean, market):
+    """Cached single-ticker news sentiment (same store as /news-sentiment)."""
+    key = market + ":" + sym_clean
+    now = time_module.time()
+    c = _NEWS_SENT_CACHE.get(key)
+    if c and now - c[0] < _NEWS_SENT_TTL:
+        return c[1]
+    items = [{"sym": sym_clean, "headlines": _fetch_symbol_headlines(sym_clean, market)}]
+    scored = _score_news_claude(items) if _ANTHROPIC_KEY else None
+    if scored is None:
+        scored = {sym_clean: _score_news_keyword(sym_clean, items[0]["headlines"])}
+    res = scored.get(sym_clean) or _score_news_keyword(sym_clean, [])
+    _NEWS_SENT_CACHE[key] = (now, res)
+    return res
+
+# News strongly opposing the trade direction vetoes the signal (|score| ≥ this).
+_NEWS_VETO = 0.4
+
 def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     """Open ONLY high-conviction, trend-aligned signals (score 6, max) with the profitable
-    tight-target (0.75 ATR) / wide-stop (2.0 ATR) profile — fewer, higher win-rate trades."""
+    tight-target (0.75 ATR) / wide-stop (2.0 ATR) profile — fewer, higher win-rate trades.
+    A news-sentiment gate additionally vetoes setups whose recent news strongly opposes them."""
     if abs(r["score"]) < 6 or r["type"] == "NEUTRAL":
         return
     if not r.get("trend_ok", False):     # must trade with the long-term (EMA200) trend
@@ -6573,13 +6592,27 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
            and t["market"] == market and t["kind"] == kind):
         return
     side = "buy" if r["score"] > 0 else "sell"
+    clean_sym = r["sym"].replace(".NS", "")
+    # ── AI news-sentiment gate + alert context ──
+    news = {}
+    try:
+        news = _news_sentiment_one(clean_sym, market) or {}
+    except Exception:
+        news = {}
+    nlabel = news.get("label", "neutral"); nscore = float(news.get("score", 0) or 0)
+    if (side == "buy" and nscore <= -_NEWS_VETO) or (side == "sell" and nscore >= _NEWS_VETO):
+        return   # recent news strongly conflicts with the setup — skip it
     d = 1 if side == "buy" else -1
     entry = r["price"]; atr = r["atr"]
     t1 = round(entry + d * 0.75 * atr, 2); sl = round(entry - d * 2.0 * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
                    "entry": entry, "t1": t1, "sl": sl, "status": "open"})
-    clean_sym = r["sym"].replace(".NS", "")
     msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" % (kind.title(), side.upper(), clean_sym, entry, t1, sl)
+    emoji = "📈" if nlabel == "bullish" else "📉" if nlabel == "bearish" else "📰"
+    tag = "🤖 AI" if news.get("engine") == "claude" else "📰"
+    reason = (news.get("reason") or "").strip()
+    msg += "\n%s News: %s (%+.2f)%s" % (emoji, nlabel, nscore, (" — " + reason) if reason else "")
+    msg += " · %s" % tag
     # One-tap semi-auto: India trades get a Zerodha order link (user reviews & confirms in Kite)
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:%s" % (clean_sym, side.upper())
