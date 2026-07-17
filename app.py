@@ -2929,6 +2929,41 @@ def send_welcome():
         return jsonify({"sent": False, "error": str(e)}), 200
 
 
+@app.route("/news-sentiment", methods=["POST"])
+def news_sentiment():
+    """AI news-sentiment per ticker. Body: {symbols:[...], market:'india'|'us'}.
+    Returns {engine, results:{SYM:{label,score,reason,headlines}}}. Cached 15 min.
+    Uses Claude when ANTHROPIC_API_KEY is set; keyword event-scorer otherwise."""
+    try:
+        d = request.get_json(force=True, silent=True) or {}
+        market = (d.get("market") or "india").lower()
+        syms = [str(s).upper().strip() for s in (d.get("symbols") or []) if str(s).strip()][:12]
+        if not syms:
+            return jsonify({"engine": "none", "results": {}}), 200
+        now = time_module.time()
+        results, need = {}, []
+        for s in syms:
+            c = _NEWS_SENT_CACHE.get(market + ":" + s)
+            if c and now - c[0] < _NEWS_SENT_TTL:
+                results[s] = c[1]
+            else:
+                need.append(s)
+        engine = "cache"
+        if need:
+            items = [{"sym": s, "headlines": _fetch_symbol_headlines(s, market)} for s in need]
+            scored = _score_news_claude(items) if _ANTHROPIC_KEY else None
+            engine = "claude" if scored else "keyword"
+            if scored is None:
+                scored = {it["sym"]: _score_news_keyword(it["sym"], it["headlines"]) for it in items}
+            for s in need:
+                res = scored.get(s) or _score_news_keyword(s, [])
+                _NEWS_SENT_CACHE[market + ":" + s] = (now, res)
+                results[s] = res
+        return jsonify({"engine": engine, "results": results}), 200
+    except Exception as e:
+        return jsonify({"engine": "error", "error": str(e), "results": {}}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
@@ -6105,6 +6140,120 @@ def _welcome_html(name):
     </p>
   </div>
 </div>""" % name
+
+# ── AI news-sentiment layer ──────────────────────────────────────────────────
+# Reads each ticker's recent stock-specific headlines and judges how they affect
+# the stock over the next 1-2 weeks. Powered by Claude when ANTHROPIC_API_KEY is
+# set; otherwise a keyword event-scorer runs so the feature works with no key.
+import xml.etree.ElementTree as _ET
+
+_ANTHROPIC_KEY   = _clean_env("ANTHROPIC_API_KEY", "CLAUDE_API_KEY")
+_ANTHROPIC_MODEL = _clean_env("ANTHROPIC_MODEL") or "claude-haiku-4-5-20251001"
+_NEWS_SENT_CACHE = {}      # "market:SYM" -> (ts, result)
+_NEWS_SENT_TTL   = 900     # 15 min — news doesn't change minute-to-minute
+
+def _news_query(sym, market):
+    if (market or "india") == "us":
+        return '"%s" stock when:3d' % sym
+    return '"%s" (share price OR NSE OR results OR order) when:3d' % sym
+
+def _fetch_symbol_headlines(sym, market, limit=5):
+    try:
+        q = requests.utils.quote(_news_query(sym, market))
+        hl = "en-US&gl=US&ceid=US:en" if (market or "india") == "us" else "en-IN&gl=IN&ceid=IN:en"
+        url = "https://news.google.com/rss/search?q=%s&hl=%s" % (q, hl)
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        root = _ET.fromstring(r.content)
+        titles = []
+        for item in root.iter("item"):
+            t = (item.findtext("title") or "").strip()
+            if " - " in t:
+                t = t.rsplit(" - ", 1)[0].strip()   # drop trailing " - Source"
+            if t:
+                titles.append(t)
+            if len(titles) >= limit:
+                break
+        return titles
+    except Exception:
+        return []
+
+_BULL_EVENTS = {
+    'surge': 2, 'surges': 2, 'jump': 2, 'jumps': 2, 'rally': 2, 'soar': 3, 'soars': 3,
+    'record high': 3, 'all-time high': 3, 'beats': 3, 'beat estimate': 3, 'profit rise': 3,
+    'profit jump': 3, 'upgrade': 3, 'upgraded': 3, 'buy rating': 3, 'target raised': 3,
+    'wins order': 3, 'bags order': 3, 'order win': 3, 'new order': 2, 'bonus': 2,
+    'stake buy': 2, 'acquisition': 2, 'strong result': 3, 'guidance raised': 3,
+    'outperform': 2, 'multibagger': 2, 'gains': 1, 'dividend': 1,
+}
+_BEAR_EVENTS = {
+    'plunge': 3, 'plunges': 3, 'crash': 3, 'slump': 2, 'slumps': 2, 'tumble': 2, 'tumbles': 2,
+    'sinks': 2, 'miss': 3, 'misses': 3, 'profit fall': 3, 'profit drop': 3, 'loss': 2,
+    'downgrade': 3, 'downgraded': 3, 'sell rating': 3, 'target cut': 3, 'probe': 3,
+    'investigation': 3, 'fraud': 3, 'raid': 3, 'penalty': 2, 'fine': 2, 'ban': 2,
+    'default': 3, 'weak result': 3, 'guidance cut': 3, 'underperform': 2, 'stake sale': 2,
+    'resigns': 2, 'layoff': 2, 'lawsuit': 2, 'downgrades': 3,
+}
+
+def _score_news_keyword(sym, headlines):
+    if not headlines:
+        return {"label": "neutral", "score": 0.0, "reason": "No recent stock-specific news.", "headlines": [], "engine": "keyword"}
+    text = " || ".join(headlines).lower()
+    pos = sum(w for k, w in _BULL_EVENTS.items() if k in text)
+    neg = sum(w for k, w in _BEAR_EVENTS.items() if k in text)
+    score = max(-1.0, min(1.0, (pos - neg) / 6.0))
+    label = "bullish" if score > 0.15 else "bearish" if score < -0.15 else "neutral"
+    lead = "Coverage leans %s" % label if label != "neutral" else "Mixed / neutral coverage"
+    reason = '%s — e.g. "%s"' % (lead, headlines[0][:90])
+    return {"label": label, "score": round(score, 2), "reason": reason, "headlines": headlines[:3], "engine": "keyword"}
+
+def _score_news_claude(items):
+    """items: [{sym, headlines}] → {sym: {label, score, reason}}; None on failure."""
+    try:
+        blocks = []
+        for it in items:
+            hl = it.get("headlines") or []
+            body = "\n".join("- " + h for h in hl) if hl else "- (no recent news)"
+            blocks.append("%s:\n%s" % (it["sym"], body))
+        prompt = (
+            "You are an equity news analyst. For each ticker, judge how its RECENT headlines affect "
+            "the stock over the next 1-2 weeks. Weigh real events (earnings, guidance, orders, "
+            "upgrades/downgrades, regulatory/legal, management changes); ignore generic index commentary.\n\n"
+            + "\n\n".join(blocks) +
+            '\n\nReturn ONLY a JSON object mapping each ticker to '
+            '{"label":"bullish|bearish|neutral","score":<number -1..1>,"reason":"<max 14 words, cite the event>"}. '
+            "No prose, no markdown fences."
+        )
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages", timeout=30,
+            headers={"x-api-key": _ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": _ANTHROPIC_MODEL, "max_tokens": 800, "messages": [{"role": "user", "content": prompt}]},
+        )
+        if r.status_code != 200:
+            logging.warning("news claude HTTP %s: %s", r.status_code, r.text[:200])
+            return None
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+        i0, i1 = txt.find("{"), txt.rfind("}")
+        if i0 < 0 or i1 < 0:
+            return None
+        data = json.loads(txt[i0:i1 + 1])
+        out = {}
+        for it in items:
+            d = data.get(it["sym"]) or {}
+            lbl = str(d.get("label", "neutral")).lower()
+            if lbl not in ("bullish", "bearish", "neutral"):
+                lbl = "neutral"
+            try:
+                sc = max(-1.0, min(1.0, float(d.get("score", 0))))
+            except Exception:
+                sc = 0.0
+            out[it["sym"]] = {"label": lbl, "score": round(sc, 2),
+                              "reason": str(d.get("reason", "") or "")[:140],
+                              "headlines": (it.get("headlines") or [])[:3], "engine": "claude"}
+        return out
+    except Exception as e:
+        try: logging.warning("news claude failed: %s", e)
+        except Exception: pass
+        return None
 
 def _kv_file(key):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), key + ".json")
