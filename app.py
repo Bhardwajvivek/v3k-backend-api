@@ -5991,8 +5991,18 @@ def _tg_send(text, chat=None):
 # Render's free disk is EPHEMERAL — wiped on every restart/redeploy — which erased open
 # trades before they could hit target/SL (no exit alerts) and emptied the report. When the
 # two Upstash env vars are set, state persists forever across restarts.
-_UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-_UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+def _clean_env(*names):
+    """Return the first set env var, stripped of whitespace and stray surrounding quotes."""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v.strip().strip('"').strip("'").strip()
+    return ""
+
+# Tolerant of the common setup mistakes: URL saved under UPSTASH_REDIS_REST_URL OR the
+# accidental name PSTA, and values pasted with surrounding "quotes".
+_UPSTASH_URL = _clean_env("UPSTASH_REDIS_REST_URL", "PSTA").rstrip("/")
+_UPSTASH_TOKEN = _clean_env("UPSTASH_REDIS_REST_TOKEN")
 # kvdb.io bucket (owner's, created under bhardwajvivek.v3@gmail.com). Free persistent JSON
 # store — works once the owner clicks the kvdb verification email. Override via env if needed.
 _KVDB_BUCKET = os.environ.get("KVDB_BUCKET", "EJPanNCNcXa88zUcE8gHrV")
