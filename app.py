@@ -2897,6 +2897,38 @@ def api_get_enhanced_signals():
 
 # ====== HEALTH CHECK ======
 
+@app.route("/send-welcome", methods=["POST"])
+def send_welcome():
+    """Send a one-time welcome email to a newly signed-up user.
+    Called fire-and-forget by the frontend on signup. No-ops safely if email
+    isn't configured (returns sent:false) so signup never breaks."""
+    try:
+        d = request.get_json(force=True, silent=True) or {}
+        email = (d.get("email") or "").strip().lower()
+        name = (d.get("name") or "").strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            return jsonify({"sent": False, "error": "invalid email"}), 400
+        if not _email_configured():
+            return jsonify({"sent": False, "reason": "email not configured"}), 200
+        # De-dup: never welcome the same address twice.
+        try:
+            welcomed = _kv_get("v3k_welcomed", []) or []
+        except Exception:
+            welcomed = []
+        if email in welcomed:
+            return jsonify({"sent": False, "reason": "already welcomed"}), 200
+        ok = _send_email(email, "Welcome to V3K AI Trading Bot Pro 🚀", _welcome_html(name))
+        if ok:
+            try:
+                welcomed.append(email)
+                _kv_set("v3k_welcomed", welcomed[-5000:])
+            except Exception:
+                pass
+        return jsonify({"sent": bool(ok)}), 200
+    except Exception as e:
+        return jsonify({"sent": False, "error": str(e)}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
@@ -6006,6 +6038,73 @@ _UPSTASH_TOKEN = _clean_env("UPSTASH_REDIS_REST_TOKEN")
 # kvdb.io bucket (owner's, created under bhardwajvivek.v3@gmail.com). Free persistent JSON
 # store — works once the owner clicks the kvdb verification email. Override via env if needed.
 _KVDB_BUCKET = os.environ.get("KVDB_BUCKET", "EJPanNCNcXa88zUcE8gHrV")
+
+# ── Transactional email (welcome mail on signup) ─────────────────────────────
+# Uses plain Gmail SMTP so no extra pip deps are needed (smtplib is stdlib).
+# Owner sets two Render env vars — until then _send_email() silently no-ops:
+#   GMAIL_USER          = the Gmail address that sends the mail (e.g. v3kbot...@gmail.com)
+#   GMAIL_APP_PASSWORD  = a 16-char Google "App Password" (NOT the normal login password)
+_SMTP_USER = _clean_env("GMAIL_USER", "SMTP_USER", "MAIL_USER")
+_SMTP_PASS = _clean_env("GMAIL_APP_PASSWORD", "SMTP_PASS", "MAIL_PASS")
+_SMTP_HOST = _clean_env("SMTP_HOST") or "smtp.gmail.com"
+_SMTP_PORT = int(_clean_env("SMTP_PORT") or "587")
+_MAIL_FROM = _clean_env("MAIL_FROM") or "V3K AI Trading Bot"
+
+def _email_configured():
+    return bool(_SMTP_USER and _SMTP_PASS)
+
+def _send_email(to_addr, subject, html_body):
+    """Send one HTML email. Returns True on success, False if not configured or on error."""
+    if not _email_configured():
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.utils import formataddr
+        msg = MIMEText(html_body, "html", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = formataddr((_MAIL_FROM, _SMTP_USER))
+        msg["To"] = to_addr
+        s = smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=20)
+        s.starttls()
+        s.login(_SMTP_USER, _SMTP_PASS)
+        s.sendmail(_SMTP_USER, [to_addr], msg.as_string())
+        s.quit()
+        return True
+    except Exception as e:
+        try: logging.warning("send_email failed: %s", e)
+        except Exception: pass
+        return False
+
+def _welcome_html(name):
+    name = (name or "there").strip() or "there"
+    return """\
+<div style="margin:0;padding:0;background:#0A0A0C;font-family:Segoe UI,Arial,sans-serif;">
+  <div style="max-width:520px;margin:0 auto;padding:32px 24px;color:#EAEAEA;">
+    <div style="text-align:center;margin-bottom:24px;">
+      <div style="display:inline-block;padding:14px 26px;border-radius:16px;
+        background:linear-gradient(135deg,#FFB020,#FF6B5C);color:#0A0A0C;
+        font-size:26px;font-weight:800;letter-spacing:1px;">V3K</div>
+    </div>
+    <h1 style="font-size:22px;margin:0 0 12px;color:#FFB020;">Welcome aboard, %s! 🚀</h1>
+    <p style="font-size:15px;line-height:1.6;color:#CFCFCF;margin:0 0 16px;">
+      Your <b>V3K AI Trading Bot Pro</b> account is ready and your
+      <b style="color:#FFB020;">30-day free trial</b> has started.
+    </p>
+    <p style="font-size:15px;line-height:1.6;color:#CFCFCF;margin:0 0 16px;">
+      You now get high-conviction, trend-aligned signals across NSE, US, crypto &amp;
+      commodities — with real-time Telegram alerts on every entry, target and stop.
+    </p>
+    <div style="background:#141418;border:1px solid #2A2A30;border-radius:12px;
+      padding:16px 18px;margin:20px 0;font-size:14px;line-height:1.6;color:#BDBDBD;">
+      ⚠️ <b>Important:</b> V3K provides research and educational signals only — not
+      investment advice. Trade at your own risk and always honour your stop-loss.
+    </div>
+    <p style="font-size:13px;color:#7A7A82;margin:24px 0 0;text-align:center;">
+      — Team V3K &middot; This is an automated message, please don&#39;t reply.
+    </p>
+  </div>
+</div>""" % name
 
 def _kv_file(key):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), key + ".json")
