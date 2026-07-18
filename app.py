@@ -6817,9 +6817,29 @@ _WATCH_IN = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN
              "TATAMOTORS.NS","BHARTIARTL.NS","LT.NS","AXISBANK.NS","MARUTI.NS","SUNPHARMA.NS"]
 _WATCH_US = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","JPM","NFLX","AVGO","QCOM"]
 
+_RETRAIN_EVERY = 7 * 86400   # weekly
+
+def _maybe_weekly_retrain():
+    """Auto-retrain the model ~weekly, folding in the newest live outcomes. Piggybacks on the
+    scan heartbeat (internal loop + /cron/scan pings) so NO separate scheduler is needed."""
+    try:
+        last = float(_kv_get("v3k_last_retrain", 0) or 0)
+    except Exception:
+        last = 0.0
+    now = time_module.time()
+    if now - last >= _RETRAIN_EVERY:
+        try:
+            _kv_set("v3k_last_retrain", now)   # claim the slot first so pings don't double-fire
+            threading.Thread(target=_train_model, daemon=True).start()
+            return True
+        except Exception:
+            pass
+    return False
+
 def _run_scan():
     """One scan cycle: swing + intraday trade tracking + price alerts → Telegram."""
     from datetime import timezone
+    retrained = _maybe_weekly_retrain()
     now = datetime.now(timezone.utc)
     istmin = (now.hour * 60 + now.minute + 330) % 1440
     us = (istmin >= 1140 or istmin <= 90)
@@ -6910,11 +6930,17 @@ def _run_scan():
     if changed:
         _alerts_save(alerts)
     open_trades = len([t for t in trades if t["status"] == "open"])
+    try:
+        _last_rt = float(_kv_get("v3k_last_retrain", 0) or 0)
+        next_rt_days = round(max(0, (_last_rt + _RETRAIN_EVERY - time_module.time())) / 86400, 1) if _last_rt else 0
+    except Exception:
+        next_rt_days = None
     return {"scanned": len(syms), "new_signals": len(opened_msgs),
             "market": "US" if us else "India",
             "market_open": open_market or "closed",
             "intraday_active": bool(open_market),
             "open_trades": open_trades, "storage": _storage_kind(),
+            "retrained_now": retrained, "next_retrain_in_days": next_rt_days,
             "events": opened_msgs + closed_msgs}
 
 @app.route("/cron/scan", methods=["GET", "POST"])
@@ -7089,6 +7115,10 @@ except Exception:
 def _model_bootstrap():
     try:
         _train_model()
+        # Starting the weekly clock here means each deploy's startup train counts as the
+        # weekly retrain; the scan-timer only fires if the service runs 7+ days without a deploy.
+        try: _kv_set("v3k_last_retrain", time_module.time())
+        except Exception: pass
     except Exception:
         pass
 
