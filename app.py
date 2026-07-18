@@ -7401,9 +7401,8 @@ def _strategy_backtest(market, tgt_m=0.75, stp_m=2.0, H=None):
         "buys": sum(1 for t in allt if t["dir"] == "BUY"),
         "sells": sum(1 for t in allt if t["dir"] == "SELL"),
         "recent": allt[-8:],
-        "note": "Full stacked strategy (conviction + trend + regime + relative strength), 0.75/2.0 ATR profile, "
-                "net of %.2f%%/trade costs. One position per symbol at a time. Past performance is not indicative "
-                "of future results." % _BT_COST,
+        "note": "Full stacked strategy (conviction + trend + regime + relative strength), net of %.2f%%/trade "
+                "costs. One position per symbol at a time. Past performance is not indicative of future results." % _BT_COST,
     }
     _BT_CACHE[ck] = (now, res); return res
 
