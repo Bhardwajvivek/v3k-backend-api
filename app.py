@@ -6483,6 +6483,7 @@ def _signal_tf(sym, period="1y", interval="1d"):
     h = yf.Ticker(sym).history(period=period, interval=interval)
     if len(h) < 60:
         return None
+    ic = _aligned_idx_closes(h, sym, period, interval)
     c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
     i = len(c) - 1
     e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
@@ -6507,7 +6508,7 @@ def _signal_tf(sym, period="1y", interval="1d"):
     ml = None; feat = None
     try:
         dr = 1 if s >= 0 else -1
-        feat = _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr)
+        feat = _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr, ic)
         ml = _ml_prob(feat)
     except Exception:
         ml = None; feat = None
@@ -6533,7 +6534,8 @@ def _composite_signal(sym):
 # ══════════════════════════════════════════════════════════════════════════════
 _FEATURES = ["ema20_50","ema50_200","px_ema20","macd_hist","rsi","atr_pct",
              "breakout","vol_ratio","mom10","mom20",
-             "dist_52w_hi","dist_52w_lo","up_ratio10","atr_regime"]
+             "dist_52w_hi","dist_52w_lo","up_ratio10","atr_regime",
+             "rs20_idx","rs60_idx"]   # relative strength vs the benchmark index (cross-sectional edge)
 _MODEL = {"ready": False}
 _ML_HORIZON = 10
 _ML_ATR = 1.5          # (legacy) symmetric barrier — kept for reference
@@ -6568,7 +6570,29 @@ def _atr_at(hi, lo, c, i, n=14):
         s+=max(hi[k]-lo[k], abs(hi[k]-c[k-1]), abs(lo[k]-c[k-1]))
     return s/n
 
-def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr):
+_IDX_HIST_CACHE = {}   # (idx_sym,period,interval) -> (ts, DataFrame)
+def _index_hist(idx_sym, period, interval):
+    key = (idx_sym, period, interval); now = time_module.time(); c = _IDX_HIST_CACHE.get(key)
+    if c and now - c[0] < 3600:
+        return c[1]
+    try:
+        h = yf.Ticker(idx_sym).history(period=period, interval=interval)
+    except Exception:
+        h = None
+    _IDX_HIST_CACHE[key] = (now, h); return h
+
+def _aligned_idx_closes(h, sym, period, interval):
+    """Index close series aligned (by date) to a stock's history — for per-bar relative strength."""
+    idx_sym = "^NSEI" if str(sym).endswith(".NS") else "^GSPC"
+    try:
+        ih = _index_hist(idx_sym, period, interval)
+        if ih is not None and len(ih):
+            return list(ih["Close"].reindex(h.index).ffill().bfill())
+    except Exception:
+        pass
+    return [None] * len(h)
+
+def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr, ic=None):
     price=c[i]
     f=[]
     f.append(((e20[i]-e50[i])/e50[i])*dr if (e20[i] and e50[i]) else 0.0)
@@ -6601,12 +6625,20 @@ def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr):
         av = _atr_at(hi,lo,c,k)
         if av: a_avg += av; cnt += 1
     f.append((a_now/(a_avg/cnt)) if (cnt and a_avg) else 1.0)
+    # relative strength vs the benchmark index over 20 & 60 bars (× direction) — cross-sectional edge
+    def _rs(n):
+        if ic is None or i < n or not c[i-n] or not ic[i] or not ic[i-n]:
+            return 0.0
+        return ((price/c[i-n] - 1) - (ic[i]/ic[i-n] - 1)) * dr
+    f.append(_rs(20))
+    f.append(_rs(60))
     return f
 
 def _signal_samples(sym):
     """Build (features, win/loss) samples from 2y history for every signal bar."""
     h = yf.Ticker(sym).history(period="2y", interval="1d")
     if len(h) < 160: return [], []
+    ic=_aligned_idx_closes(h, sym, "2y", "1d")
     c=list(h["Close"]); hi=list(h["High"]); lo=list(h["Low"]); vol=list(h["Volume"])
     e20=_ema(c,20); e50=_ema(c,50); e200=_ema(c,200); e12=_ema(c,12); e26=_ema(c,26)
     macd=[(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
@@ -6636,7 +6668,7 @@ def _signal_samples(sym):
             else:
                 if lo[k]<=tgt: label=1; break
                 if hi[k]>=stp: label=0; break
-        X.append(_feat_vec(c,hi,lo,vol,e20,e50,e200,macd,sig,rsiS,i,dr)); Y.append(label)
+        X.append(_feat_vec(c,hi,lo,vol,e20,e50,e200,macd,sig,rsiS,i,dr,ic)); Y.append(label)
     return X, Y
 
 # ── Live outcome log — features of each fired trade + its realized win/loss ──
