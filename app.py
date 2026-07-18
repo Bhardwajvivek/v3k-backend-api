@@ -6929,6 +6929,7 @@ def _run_scan():
     """One scan cycle: swing + intraday trade tracking + price alerts → Telegram."""
     from datetime import timezone
     retrained = _maybe_weekly_retrain()
+    _maybe_weekly_review()
     now = datetime.now(timezone.utc)
     istmin = (now.hour * 60 + now.minute + 330) % 1440
     us = (istmin >= 1140 or istmin <= 90)
@@ -7127,6 +7128,96 @@ def model_stats():
         return jsonify({"ready": False, "error": m.get("error", "training"), "n_train": m.get("n_train", 0)})
     keys = ("ready","acc","auc","base_rate","n_train","n_test","n_live","label_profile","features","importance","trained_at")
     return jsonify({k: m[k] for k in keys if k in m})
+
+def _journal_closed():
+    try:
+        trades = _swings_load() or []
+    except Exception:
+        trades = []
+    closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")]
+    for t in closed:
+        e = t["entry"]; x = t.get("exit", e)
+        t["_pnl"] = round(((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0), 2)
+    return closed
+
+def _journal_facts(closed):
+    n = len(closed)
+    if not n:
+        return None
+    def _line(t):
+        return "%s %s %s %+.2f%%" % (t["sym"].replace(".NS", ""), t.get("side", "").upper(),
+                                     "WIN" if t["status"] == "target" else "LOSS", t["_pnl"])
+    wins = [t for t in closed if t["status"] == "target"]
+    buys = [t for t in closed if t.get("side") == "buy"]; sells = [t for t in closed if t.get("side") == "sell"]
+    pnls = [t["_pnl"] for t in closed]
+    return {"n": n, "wins": len(wins), "losses": n - len(wins),
+            "win_rate": round(len(wins) / n * 100, 1),
+            "avg_pnl": round(sum(pnls) / n, 2), "total_pnl": round(sum(pnls), 2),
+            "buy_n": len(buys), "buy_win": round(sum(1 for t in buys if t["status"] == "target") / max(1, len(buys)) * 100, 0),
+            "sell_n": len(sells), "sell_win": round(sum(1 for t in sells if t["status"] == "target") / max(1, len(sells)) * 100, 0),
+            "best": _line(max(closed, key=lambda t: t["_pnl"])), "worst": _line(min(closed, key=lambda t: t["_pnl"])),
+            "recent": [_line(t) for t in closed[-8:]]}
+
+def _journal_review(force=False):
+    """Claude-written honest weekly review of the user's OWN closed trades (cached ~6d)."""
+    now = time_module.time()
+    prev = _kv_get("v3k_journal", None)
+    if prev and not force and now - float(prev.get("generated_at", 0) or 0) < 6 * 86400:
+        return prev
+    facts = _journal_facts(_journal_closed())
+    if not facts:
+        rev = {"text": "No closed trades yet — your weekly review appears here once trades hit target or stop.",
+               "engine": "none", "generated_at": now, "n": 0}
+        _kv_set("v3k_journal", rev); return rev
+    f = facts; engine = "template"; text = ""
+    if _ANTHROPIC_KEY:
+        try:
+            prompt = ("You are a candid trading coach reviewing a trader's OWN recent closed trades. Write a "
+                      "3-4 sentence review: what's working, what's not, one pattern (e.g. longs vs shorts, win-rate vs "
+                      "average size), and ONE concrete honest improvement. No hype, no buy/sell advice, no disclaimers.\n\n"
+                      "Closed trades: %d (win-rate %.1f%%, total %+.2f%%, avg %+.2f%%/trade). "
+                      "Longs: %d (%.0f%% win). Shorts: %d (%.0f%% win). Best: %s. Worst: %s.\nRecent: %s"
+                      % (f["n"], f["win_rate"], f["total_pnl"], f["avg_pnl"], f["buy_n"], f["buy_win"],
+                         f["sell_n"], f["sell_win"], f["best"], f["worst"], "; ".join(f["recent"])))
+            r = requests.post("https://api.anthropic.com/v1/messages", timeout=25,
+                headers={"x-api-key": _ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": _ANTHROPIC_MODEL, "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code == 200:
+                text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                engine = "claude" if text else "template"
+        except Exception as e:
+            try: logging.warning("journal claude failed: %s", e)
+            except Exception: pass
+    if not text:
+        text = ("This period: %d closed trades, %.1f%% win-rate, %+.2f%% total (%+.2f%%/trade). Longs %.0f%% win vs "
+                "shorts %.0f%% win. Best %s; worst %s. Keep honouring stops and lean toward whichever side is working."
+                % (f["n"], f["win_rate"], f["total_pnl"], f["avg_pnl"], f["buy_win"], f["sell_win"], f["best"], f["worst"]))
+    rev = {"text": text, "engine": engine, "generated_at": now, "n": f["n"], "stats": f}
+    _kv_set("v3k_journal", rev); return rev
+
+def _maybe_weekly_review():
+    """Auto-generate + Telegram-send the weekly journal review (piggybacks on the scan heartbeat)."""
+    try:
+        last = float(_kv_get("v3k_last_review", 0) or 0)
+    except Exception:
+        last = 0.0
+    if time_module.time() - last >= 7 * 86400:
+        try:
+            _kv_set("v3k_last_review", time_module.time())
+            def _job():
+                rev = _journal_review(force=True)
+                if rev.get("n"):
+                    _tg_send("📓 V3K Weekly Review\n" + rev.get("text", ""))
+            threading.Thread(target=_job, daemon=True).start()
+            return True
+        except Exception:
+            pass
+    return False
+
+@app.route("/journal-review", methods=["GET"])
+def journal_review():
+    """AI weekly performance review of the user's own closed trades. ?force=1 regenerates."""
+    return jsonify(_journal_review(force=(request.args.get("force") == "1"))), 200
 
 @app.route("/track-record", methods=["GET"])
 def track_record():
