@@ -6583,7 +6583,7 @@ def _signal_samples(sym):
     macd=[(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
     sig=_ema([0 if x is None else x for x in macd],9)
     rsiS=_rsi_series(c)
-    X=[]; Y=[]; H=_ML_HORIZON
+    X=[]; Y=[]; H=_ML_HORIZON; M=_ML_ATR
     for i in range(200, len(c)-H):
         price=c[i]; s=0
         if e20[i] and e50[i]:  s+= 1 if e20[i]>e50[i] else -1
@@ -6598,7 +6598,7 @@ def _signal_samples(sym):
         if abs(s) < 3: continue
         dr = 1 if s>0 else -1
         atr=_atr_at(hi,lo,c,i) or price*0.02
-        tgt=price+dr*_ML_TGT*atr; stp=price-dr*_ML_STP*atr
+        tgt=price+dr*M*atr; stp=price-dr*M*atr   # validated symmetric barrier (AUC ~0.55)
         label=0
         for k in range(i+1, i+1+H):
             if dr>0:
@@ -6668,7 +6668,7 @@ def _train_model():
               "acc": round(float(accuracy_score(Yte_a, pred)), 3), "auc": auc,
               "base_rate": round(float(np.mean(np.concatenate([Ytr_a, Yte_a]))), 3),
               "n_train": len(Xtr), "n_test": len(Xte), "n_live": n_live, "features": _FEATURES,
-              "label_profile": "target %.2f ATR / stop %.2f ATR / %dd" % (_ML_TGT, _ML_STP, _ML_HORIZON),
+              "label_profile": "target/stop %.1f ATR / %dd (historical) + live traded outcomes" % (_ML_ATR, _ML_HORIZON),
               "importance": {_FEATURES[i]: round(float(imp[i]), 3) for i in range(len(_FEATURES))},
               "trained_at": datetime.utcnow().isoformat()}
     return _MODEL
