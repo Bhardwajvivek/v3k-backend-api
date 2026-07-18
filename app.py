@@ -7289,7 +7289,8 @@ _BT_TTL   = 6 * 3600
 _BT_H     = 10          # max holding bars
 _BT_COST  = 0.15        # round-trip cost % (brokerage + slippage), applied per trade
 
-def _backtest_symbol(sym, market, e200_idx_cache):
+def _backtest_symbol(sym, market, tgt_m=0.75, stp_m=2.0, H=None):
+    H = H or _BT_H
     h = yf.Ticker(sym).history(period="2y", interval="1d")
     if len(h) < 220:
         return []
@@ -7332,9 +7333,9 @@ def _backtest_symbol(sym, market, e200_idx_cache):
                 i += 1; continue
         # enter — traded profile: 0.75 ATR target / 2.0 ATR stop
         atr = _atr_at(hi, lo, c, i) or price * 0.02
-        tgt = price + dr*0.75*atr; stp = price - dr*2.0*atr
+        tgt = price + dr*tgt_m*atr; stp = price - dr*stp_m*atr
         outcome = None; exitp = None; held = 0
-        for k in range(i+1, min(len(c), i+1+_BT_H)):
+        for k in range(i+1, min(len(c), i+1+H)):
             held = k - i
             if dr > 0:
                 if hi[k] >= tgt: outcome, exitp = "win", tgt; break
@@ -7343,30 +7344,31 @@ def _backtest_symbol(sym, market, e200_idx_cache):
                 if lo[k] <= tgt: outcome, exitp = "win", tgt; break
                 if hi[k] >= stp: outcome, exitp = "loss", stp; break
         if outcome is None:
-            k = min(len(c)-1, i+_BT_H); exitp = c[k]; held = k - i
+            k = min(len(c)-1, i+H); exitp = c[k]; held = k - i
         pnl = (exitp - price) / price * 100.0 * dr - _BT_COST   # net of costs
         trades.append({"date": str(dates[i])[:10], "sym": sym.replace(".NS", ""),
                        "dir": "BUY" if dr > 0 else "SELL", "pnl": round(pnl, 2), "held": held})
         i = i + held + 1   # no overlapping trades on the same symbol
     return trades
 
-def _strategy_backtest(market):
+def _strategy_backtest(market, tgt_m=0.75, stp_m=2.0, H=None):
     market = "us" if market == "us" else "india"
-    now = time_module.time(); c0 = _BT_CACHE.get(market)
+    ck = "%s:%.2f:%.2f:%s" % (market, tgt_m, stp_m, H or _BT_H)
+    now = time_module.time(); c0 = _BT_CACHE.get(ck)
     if c0 and now - c0[0] < _BT_TTL:
         return c0[1]
     syms = _WATCH_US if market == "us" else _WATCH_IN
     allt = []
     for sym in syms:
         try:
-            allt += _backtest_symbol(sym, market, {})
+            allt += _backtest_symbol(sym, market, tgt_m, stp_m, H)
         except Exception:
             pass
     allt.sort(key=lambda t: t["date"])
     n = len(allt)
     if not n:
         res = {"market": market, "trades": 0, "note": "Not enough qualifying setups in 2y history."}
-        _BT_CACHE[market] = (now, res); return res
+        _BT_CACHE[ck] = (now, res); return res
     wins = [t for t in allt if t["pnl"] > 0]; pnls = [t["pnl"] for t in allt]
     # equity curve (one position at a time, compounding) → max drawdown
     eq = 1.0; peak = 1.0; mdd = 0.0
@@ -7383,6 +7385,7 @@ def _strategy_backtest(market):
     gross_win = sum(p for p in pnls if p > 0); gross_loss = -sum(p for p in pnls if p <= 0)
     res = {
         "market": market, "period": "2y", "watchlist": len(syms),
+        "profile": "%.2f ATR target / %.2f ATR stop / %dd" % (tgt_m, stp_m, H or _BT_H),
         "trades": n, "wins": len(wins), "losses": n - len(wins),
         "win_rate": round(len(wins)/n*100, 1),
         "expectancy_pct": round(sum(pnls)/n, 3),          # avg net P&L per trade
@@ -7400,12 +7403,19 @@ def _strategy_backtest(market):
                 "net of %.2f%%/trade costs. One position per symbol at a time. Past performance is not indicative "
                 "of future results." % _BT_COST,
     }
-    _BT_CACHE[market] = (now, res); return res
+    _BT_CACHE[ck] = (now, res); return res
 
 @app.route("/strategy-backtest", methods=["GET"])
 def strategy_backtest():
-    """Honest 2-year backtest of the FULL stacked-filter strategy. ?market=india|us (heavy; cached 6h)."""
-    return jsonify(_strategy_backtest((request.args.get("market") or "india").lower())), 200
+    """Honest 2-year backtest of the FULL stacked-filter strategy. ?market=india|us
+    &tgt=&stp=&h= override the ATR target/stop multipliers and holding bars (heavy; cached 6h)."""
+    def _f(name, d):
+        try: return float(request.args.get(name, d))
+        except Exception: return d
+    tgt = _f("tgt", 0.75); stp = _f("stp", 2.0)
+    try: H = int(request.args.get("h", _BT_H))
+    except Exception: H = _BT_H
+    return jsonify(_strategy_backtest((request.args.get("market") or "india").lower(), tgt, stp, H)), 200
 
 @app.route("/model/train", methods=["POST", "GET"])
 def model_train():
