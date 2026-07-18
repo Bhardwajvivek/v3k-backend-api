@@ -2929,6 +2929,85 @@ def send_welcome():
         return jsonify({"sent": False, "error": str(e)}), 200
 
 
+_EXPLAIN_CACHE = {}     # "sym|side" -> (ts, dict)
+_EXPLAIN_TTL   = 1800   # 30 min
+
+@app.route("/explain-signal", methods=["POST"])
+def explain_signal():
+    """Plain-English 'why this signal' + the #1 risk. Claude when keyed, template fallback.
+    Body: {sym, side, price, t1, sl, strat, backtest, ml, news:{label,reason}, regime, market}."""
+    try:
+        d = request.get_json(force=True, silent=True) or {}
+        sym  = str(d.get("sym", "")).upper()[:24]
+        side = "buy" if str(d.get("side", "")).lower() == "buy" else "sell"
+        if not sym:
+            return jsonify({"explanation": "", "engine": "none"}), 200
+        key = sym + "|" + side
+        now = time_module.time()
+        c = _EXPLAIN_CACHE.get(key)
+        if c and now - c[0] < _EXPLAIN_TTL:
+            return jsonify(c[1]), 200
+
+        price = d.get("price"); t1 = d.get("t1"); sl = d.get("sl")
+        strat = str(d.get("strat", ""))[:200]
+        backtest = d.get("backtest"); ml = d.get("ml")
+        news = d.get("news") or {}
+        nlabel = str(news.get("label", "")); nreason = str(news.get("reason", ""))[:160]
+        regime = str(d.get("regime", ""))[:120]
+        rr = None
+        try:
+            if price and t1 and sl and (price - sl) != 0:
+                rr = round(abs((t1 - price) / (price - sl)), 2)
+        except Exception:
+            rr = None
+
+        facts = (
+            "Ticker: %s\nDirection: %s\nEntry: %s  Target: %s  Stop: %s  (reward:risk ≈ %s)\n"
+            "Technical basis: %s\nBacktested win-rate: %s%%\nML win-probability: %s%%\n"
+            "News sentiment: %s — %s\nMarket regime: %s"
+            % (sym, side.upper(), price, t1, sl, rr, strat, backtest,
+               ml if ml is not None else "n/a", nlabel or "n/a", nreason or "n/a", regime or "n/a")
+        )
+
+        engine = "template"; text = ""
+        if _ANTHROPIC_KEY:
+            try:
+                prompt = (
+                    "You are a candid trading coach. Using ONLY the facts below, write 2-3 short sentences "
+                    "in plain English explaining WHY this setup triggered, then ONE sentence naming the single "
+                    "biggest risk. Be honest and specific, no hype, no financial advice, no disclaimers.\n\n" + facts
+                )
+                r = requests.post(
+                    "https://api.anthropic.com/v1/messages", timeout=25,
+                    headers={"x-api-key": _ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": _ANTHROPIC_MODEL, "max_tokens": 220, "messages": [{"role": "user", "content": prompt}]},
+                )
+                if r.status_code == 200:
+                    text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                    engine = "claude" if text else "template"
+            except Exception as e:
+                try: logging.warning("explain claude failed: %s", e)
+                except Exception: pass
+
+        if not text:
+            bits = []
+            bits.append("%s is flagged %s on %s." % (sym, side.upper(), strat or "the composite model"))
+            if rr is not None:
+                bits.append("The plan risks 1 to make about %s (target %s, stop %s)." % (rr, t1, sl))
+            if nlabel and nlabel != "neutral":
+                bits.append("Recent news is %s%s." % (nlabel, (": " + nreason) if nreason else ""))
+            if regime:
+                bits.append("Market backdrop: %s." % regime)
+            bits.append("Biggest risk: the wide stop means a single adverse move can erase several wins, so honour the stop.")
+            text = " ".join(bits)
+
+        out = {"explanation": text, "engine": engine, "rr": rr}
+        _EXPLAIN_CACHE[key] = (now, out)
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({"explanation": "", "engine": "error", "error": str(e)}), 200
+
+
 @app.route("/market-regime", methods=["GET"])
 def market_regime():
     """Index regime vs its 200-DMA. ?market=india|us → {regime, index, price, ema200, pct, allow_buy, allow_sell, label}."""
