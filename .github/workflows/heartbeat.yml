@@ -1,0 +1,31 @@
+name: V3K heartbeat
+
+# Keeps the Render free-tier backend awake 24/7 and drives everything hands-free:
+#   • runs the signal scan → Telegram alerts (entries, targets, stops, P&L)
+#   • monitors open trades and logs live outcomes for model learning
+#   • triggers the weekly model auto-retrain (self-managed inside /cron/scan)
+# Runs on GitHub's infrastructure — no third-party account needed.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 min (margin against Render's ~15 min sleep)
+  workflow_dispatch:          # allows a manual run from the Actions tab
+
+# Don't pile up runs if one is slow
+concurrency:
+  group: v3k-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake + scan the backend
+        run: |
+          echo "Pinging /cron/scan ..."
+          curl -fsS --max-time 90 "https://v3k-backend-api.onrender.com/cron/scan" || echo "scan ping failed (backend may be waking)"
+          echo ""
+          echo "Health check ..."
+          curl -fsS --max-time 30 "https://v3k-backend-api.onrender.com/health" || echo "health ping failed"
+          echo ""
+          echo "Heartbeat done."
