@@ -6998,7 +6998,7 @@ def _run_scan():
         # Market shut → square off any open intraday trades (never held overnight)
         for t in trades:
             if t["status"] == "open" and t["kind"] == "intraday":
-                t["status"] = "session-end"
+                t["status"] = "session-end"; t["closed_at"] = time_module.time()
                 closed_msgs.append("🔔 Intraday auto-exit: %s squared off at market close." %
                                    t["sym"].replace(".NS", ""))
 
@@ -7015,12 +7015,12 @@ def _run_scan():
         hit_s = (p <= t["sl"]) if buy else (p >= t["sl"])
         pnl = ((p - t["entry"]) / t["entry"] * 100) if buy else ((t["entry"] - p) / t["entry"] * 100)
         if hit_t:
-            t["status"] = "target"; t["exit"] = round(p, 4)
+            t["status"] = "target"; t["exit"] = round(p, 4); t["closed_at"] = time_module.time()
             _ml_log_sample(t.get("feat"), 1)   # learn: this setup reached target
             closed_msgs.append("🎯 TARGET HIT — %s %s (%s): booked %+.2f%%  ·  entry %.2f → exit %.2f  ✅ WIN" %
                                (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
         elif hit_s:
-            t["status"] = "stopped"; t["exit"] = round(p, 4)
+            t["status"] = "stopped"; t["exit"] = round(p, 4); t["closed_at"] = time_module.time()
             _ml_log_sample(t.get("feat"), 0)   # learn: this setup hit its stop
             closed_msgs.append("🛑 STOP-LOSS HIT — %s %s (%s): %+.2f%%  ·  entry %.2f → exit %.2f  ❌ LOSS" %
                                (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
