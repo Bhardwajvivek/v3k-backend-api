@@ -6475,15 +6475,18 @@ def _signal_tf(sym, period="1y", interval="1d"):
     typ = "BULLISH" if s >= 3 else ("BEARISH" if s <= -3 else "NEUTRAL")
     atr = _atr_last(hi, lo, c) or price * 0.02
     # ML win-probability for this setup (real trained model; None until trained)
-    ml = None
+    ml = None; feat = None
     try:
         dr = 1 if s >= 0 else -1
-        ml = _ml_prob(_feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr))
+        feat = _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, _rsi_series(c), i, dr)
+        ml = _ml_prob(feat)
     except Exception:
-        ml = None
+        ml = None; feat = None
     # trend alignment (price vs EMA200) — used by high-conviction filtering
     trend_ok = (e200[i] is not None) and ((s >= 0 and price > e200[i]) or (s < 0 and price < e200[i]))
     out = {"sym": sym, "score": s, "type": typ, "price": round(price, 2), "atr": atr, "trend_ok": bool(trend_ok)}
+    if feat is not None:
+        out["feat"] = feat   # logged on trade-open so the model can learn from the live outcome
     if ml is not None:
         out["ml_prob"] = round(ml, 3); out["conf"] = round(ml * 100)
     return out
@@ -6504,7 +6507,11 @@ _FEATURES = ["ema20_50","ema50_200","px_ema20","macd_hist","rsi","atr_pct",
              "dist_52w_hi","dist_52w_lo","up_ratio10","atr_regime"]
 _MODEL = {"ready": False}
 _ML_HORIZON = 10
-_ML_ATR = 1.5
+_ML_ATR = 1.5          # (legacy) symmetric barrier — kept for reference
+# Label the model on the ACTUAL traded profile so historical + live outcomes are the
+# same event (target 0.75 ATR hit before stop 2.0 ATR, within the horizon).
+_ML_TGT = 0.75
+_ML_STP = 2.0
 
 def _rsi_series(c, n=14):
     out=[None]*len(c); ag=al=0.0
@@ -6576,7 +6583,7 @@ def _signal_samples(sym):
     macd=[(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
     sig=_ema([0 if x is None else x for x in macd],9)
     rsiS=_rsi_series(c)
-    X=[]; Y=[]; H=_ML_HORIZON; M=_ML_ATR
+    X=[]; Y=[]; H=_ML_HORIZON
     for i in range(200, len(c)-H):
         price=c[i]; s=0
         if e20[i] and e50[i]:  s+= 1 if e20[i]>e50[i] else -1
@@ -6591,7 +6598,7 @@ def _signal_samples(sym):
         if abs(s) < 3: continue
         dr = 1 if s>0 else -1
         atr=_atr_at(hi,lo,c,i) or price*0.02
-        tgt=price+dr*M*atr; stp=price-dr*M*atr
+        tgt=price+dr*_ML_TGT*atr; stp=price-dr*_ML_STP*atr
         label=0
         for k in range(i+1, i+1+H):
             if dr>0:
@@ -6603,8 +6610,23 @@ def _signal_samples(sym):
         X.append(_feat_vec(c,hi,lo,vol,e20,e50,e200,macd,sig,rsiS,i,dr)); Y.append(label)
     return X, Y
 
+# ── Live outcome log — features of each fired trade + its realized win/loss ──
+def _ml_samples_load(): return _kv_get("v3k_ml_samples", []) or []
+def _ml_samples_save(s): _kv_set("v3k_ml_samples", s[-3000:])
+def _ml_log_sample(feat, label):
+    """Append one live-outcome sample (feature vector + 1=target/0=stop) for retraining."""
+    if not feat or not isinstance(feat, list) or len(feat) != len(_FEATURES):
+        return
+    try:
+        s = _ml_samples_load(); s.append({"f": feat, "y": int(label)}); _ml_samples_save(s)
+    except Exception:
+        pass
+
 def _train_model():
-    """Train + out-of-sample validate the win-probability model. Stores it in _MODEL."""
+    """Train + out-of-sample validate the win-probability model. Stores it in _MODEL.
+    Historical samples are labelled on the traded profile (0.75 ATR target / 2.0 ATR stop);
+    the LIVE fired-signal outcomes logged in v3k_ml_samples are folded into the training set
+    so the model genuinely learns from the app's own track record over time."""
     global _MODEL
     try:
         from sklearn.linear_model import LogisticRegression
@@ -6621,6 +6643,16 @@ def _train_model():
             Xtr+=x[:cut]; Ytr+=y[:cut]; Xte+=x[cut:]; Yte+=y[cut:]
         except Exception:
             pass
+    # Fold in the live track record (real fired-signal outcomes) — training set only, so the
+    # historical hold-out AUC stays an honest out-of-sample check.
+    n_live = 0
+    try:
+        for s in _ml_samples_load():
+            f = s.get("f"); y = s.get("y")
+            if isinstance(f, list) and len(f) == len(_FEATURES) and y in (0, 1):
+                Xtr.append(f); Ytr.append(int(y)); n_live += 1
+    except Exception:
+        pass
     if len(Xtr) < 150 or len(set(Ytr)) < 2 or len(Xte) < 30:
         _MODEL = {"ready": False, "error": "insufficient data", "n_train": len(Xtr), "n_test": len(Xte)}
         return _MODEL
@@ -6635,7 +6667,8 @@ def _train_model():
     _MODEL = {"ready": True, "clf": clf, "scaler": sc,
               "acc": round(float(accuracy_score(Yte_a, pred)), 3), "auc": auc,
               "base_rate": round(float(np.mean(np.concatenate([Ytr_a, Yte_a]))), 3),
-              "n_train": len(Xtr), "n_test": len(Xte), "features": _FEATURES,
+              "n_train": len(Xtr), "n_test": len(Xte), "n_live": n_live, "features": _FEATURES,
+              "label_profile": "target %.2f ATR / stop %.2f ATR / %dd" % (_ML_TGT, _ML_STP, _ML_HORIZON),
               "importance": {_FEATURES[i]: round(float(imp[i]), 3) for i in range(len(_FEATURES))},
               "trained_at": datetime.utcnow().isoformat()}
     return _MODEL
@@ -6765,7 +6798,8 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     entry = r["price"]; atr = r["atr"]
     t1 = round(entry + d * 0.75 * atr, 2); sl = round(entry - d * 2.0 * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
-                   "entry": entry, "t1": t1, "sl": sl, "status": "open"})
+                   "entry": entry, "t1": t1, "sl": sl, "status": "open",
+                   "feat": r.get("feat"), "opened_at": time_module.time()})
     msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" % (kind.title(), side.upper(), clean_sym, entry, t1, sl)
     emoji = "📈" if nlabel == "bullish" else "📉" if nlabel == "bearish" else "📰"
     tag = "🤖 AI" if news.get("engine") == "claude" else "📰"
@@ -6838,10 +6872,12 @@ def _run_scan():
         pnl = ((p - t["entry"]) / t["entry"] * 100) if buy else ((t["entry"] - p) / t["entry"] * 100)
         if hit_t:
             t["status"] = "target"; t["exit"] = round(p, 4)
+            _ml_log_sample(t.get("feat"), 1)   # learn: this setup reached target
             closed_msgs.append("🎯 TARGET HIT — %s %s (%s): booked %+.2f%%  ·  entry %.2f → exit %.2f  ✅ WIN" %
                                (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
         elif hit_s:
             t["status"] = "stopped"; t["exit"] = round(p, 4)
+            _ml_log_sample(t.get("feat"), 0)   # learn: this setup hit its stop
             closed_msgs.append("🛑 STOP-LOSS HIT — %s %s (%s): %+.2f%%  ·  entry %.2f → exit %.2f  ❌ LOSS" %
                                (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
 
@@ -6974,7 +7010,41 @@ def model_stats():
     m = _MODEL
     if not m.get("ready"):
         return jsonify({"ready": False, "error": m.get("error", "training"), "n_train": m.get("n_train", 0)})
-    return jsonify({k: m[k] for k in ("ready","acc","auc","base_rate","n_train","n_test","features","importance","trained_at")})
+    keys = ("ready","acc","auc","base_rate","n_train","n_test","n_live","label_profile","features","importance","trained_at")
+    return jsonify({k: m[k] for k in keys if k in m})
+
+@app.route("/track-record", methods=["GET"])
+def track_record():
+    """Honest LIVE track record from the app's own closed trades (persisted swings)."""
+    try:
+        trades = _swings_load() or []
+    except Exception:
+        trades = []
+    closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")]
+    def _pnl(t):
+        e = t["entry"]; x = t.get("exit", e)
+        return ((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0)
+    def _agg(rows):
+        n = len(rows)
+        if not n:
+            return {"n": 0, "win_rate": None, "avg_pnl": None, "expectancy": None}
+        wins = sum(1 for t in rows if t.get("status") == "target")
+        pnls = [_pnl(t) for t in rows]
+        return {"n": n, "wins": wins, "losses": n - wins,
+                "win_rate": round(wins / n * 100, 1),
+                "avg_pnl": round(sum(pnls) / n, 2),
+                "avg_win": round(sum(p for p in pnls if p > 0) / max(1, sum(1 for p in pnls if p > 0)), 2),
+                "avg_loss": round(sum(p for p in pnls if p <= 0) / max(1, sum(1 for p in pnls if p <= 0)), 2),
+                "expectancy": round(sum(pnls) / n, 2)}
+    try:
+        n_live = len(_ml_samples_load())
+    except Exception:
+        n_live = 0
+    return jsonify({"overall": _agg(closed),
+                    "buys": _agg([t for t in closed if t.get("side") == "buy"]),
+                    "sells": _agg([t for t in closed if t.get("side") == "sell"]),
+                    "ml_samples_logged": n_live,
+                    "note": "Live results from the app's own closed trades. Small samples are noisy — treat as directional."}), 200
 
 @app.route("/model/train", methods=["POST", "GET"])
 def model_train():
