@@ -6914,7 +6914,9 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
         return   # recent news strongly conflicts with the setup — skip it
     d = 1 if side == "buy" else -1
     entry = r["price"]; atr = r["atr"]
-    t1 = round(entry + d * 0.75 * atr, 2); sl = round(entry - d * 2.0 * atr, 2)
+    # Positive risk:reward profile (2y backtested profitable): India 2.5/1.5 ATR, US 2.0/1.0 ATR.
+    tm, sm = (2.0, 1.0) if market == "us" else (2.5, 1.5)
+    t1 = round(entry + d * tm * atr, 2); sl = round(entry - d * sm * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
                    "entry": entry, "t1": t1, "sl": sl, "status": "open",
                    "feat": r.get("feat"), "opened_at": time_module.time()})
@@ -7409,13 +7411,15 @@ def _strategy_backtest(market, tgt_m=0.75, stp_m=2.0, H=None):
 def strategy_backtest():
     """Honest 2-year backtest of the FULL stacked-filter strategy. ?market=india|us
     &tgt=&stp=&h= override the ATR target/stop multipliers and holding bars (heavy; cached 6h)."""
+    mkt = (request.args.get("market") or "india").lower()
+    dt, ds = (2.0, 1.0) if mkt == "us" else (2.5, 1.5)   # live per-market defaults
     def _f(name, d):
         try: return float(request.args.get(name, d))
         except Exception: return d
-    tgt = _f("tgt", 0.75); stp = _f("stp", 2.0)
+    tgt = _f("tgt", dt); stp = _f("stp", ds)
     try: H = int(request.args.get("h", _BT_H))
     except Exception: H = _BT_H
-    return jsonify(_strategy_backtest((request.args.get("market") or "india").lower(), tgt, stp, H)), 200
+    return jsonify(_strategy_backtest(mkt, tgt, stp, H)), 200
 
 @app.route("/model/train", methods=["POST", "GET"])
 def model_train():
