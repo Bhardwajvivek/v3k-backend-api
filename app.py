@@ -3014,6 +3014,35 @@ def market_regime():
     return jsonify(_market_regime((request.args.get("market") or "india").lower())), 200
 
 
+@app.route("/relative-strength", methods=["POST"])
+def relative_strength():
+    """Cross-sectional relative strength. Body {symbols:[...], market}. For each ticker returns
+    RS vs the index (20d/60d) plus a cross-sectional rank among the set → leader/inline/laggard."""
+    try:
+        d = request.get_json(force=True, silent=True) or {}
+        market = (d.get("market") or "india").lower()
+        syms = [str(s).upper().strip() for s in (d.get("symbols") or []) if str(s).strip()][:14]
+        if not syms:
+            return jsonify({"index": _INDEX_NAME.get("us" if market == "us" else "india"), "results": {}}), 200
+        raw = {s: _rs_one(s, market) for s in syms}
+        vals = sorted([v["rs60"] for v in raw.values() if v.get("rs60") is not None])
+        results = {}
+        for s, v in raw.items():
+            rs60 = v.get("rs60")
+            rank = None; label = "inline"; allow_buy = True; allow_sell = True
+            if rs60 is not None and vals:
+                below = sum(1 for x in vals if x < rs60)
+                rank = round(below / max(1, len(vals) - 1) * 100) if len(vals) > 1 else 50
+                label = "leader" if rank >= 66 else "laggard" if rank <= 33 else "inline"
+                allow_buy = rank >= 25          # don't buy a clear cross-sectional laggard
+                allow_sell = rank <= 75         # don't short a clear leader
+            results[s] = {"rs20": v.get("rs20"), "rs60": rs60, "ret60": v.get("ret60"),
+                          "rank": rank, "label": label, "allow_buy": allow_buy, "allow_sell": allow_sell}
+        return jsonify({"index": _INDEX_NAME.get("us" if market == "us" else "india"), "results": results}), 200
+    except Exception as e:
+        return jsonify({"index": None, "results": {}, "error": str(e)}), 200
+
+
 @app.route("/ai-selftest", methods=["GET"])
 def ai_selftest():
     """Diagnose the Claude wiring WITHOUT exposing the key. Reports whether the key is
@@ -6743,6 +6772,51 @@ def _market_regime(market):
     _REGIME_CACHE[market] = (now, out)
     return out
 
+# ── Cross-sectional relative strength (stock vs its index) ───────────────────
+# A stock outperforming the index has genuine relative strength — a stronger long
+# candidate; a laggard is a stronger short. This is a core cross-sectional edge.
+_RS_CACHE = {}          # "market:ysym" -> (ts, dict)
+_RS_TTL   = 3600
+_IDX_RET_CACHE = {}     # market -> (ts, {r20,r60})
+
+def _pct_ret(closes, n):
+    c = [x for x in closes if x is not None]
+    if len(c) <= n or c[-1-n] in (0, None):
+        return None
+    return (c[-1] / c[-1-n] - 1) * 100.0
+
+def _index_returns(market):
+    market = "us" if market == "us" else "india"
+    now = time_module.time(); c = _IDX_RET_CACHE.get(market)
+    if c and now - c[0] < _RS_TTL:
+        return c[1]
+    out = {"r20": None, "r60": None}
+    try:
+        h = yf.Ticker(_INDEX_SYM[market]).history(period="6mo", interval="1d")
+        cl = list(h["Close"]); out = {"r20": _pct_ret(cl, 20), "r60": _pct_ret(cl, 60)}
+    except Exception:
+        pass
+    _IDX_RET_CACHE[market] = (now, out); return out
+
+def _rs_one(sym, market):
+    """Relative strength of one ticker vs its index over 20d & 60d (percentage points)."""
+    market = "us" if market == "us" else "india"
+    ysym = sym if (market == "us" or "." in sym) else sym + ".NS"
+    now = time_module.time(); key = market + ":" + ysym; c = _RS_CACHE.get(key)
+    if c and now - c[0] < _RS_TTL:
+        return c[1]
+    res = {"rs20": None, "rs60": None, "ret60": None}
+    try:
+        idx = _index_returns(market)
+        h = yf.Ticker(ysym).history(period="6mo", interval="1d")
+        cl = list(h["Close"]); s20 = _pct_ret(cl, 20); s60 = _pct_ret(cl, 60)
+        res = {"rs20": (round(s20 - idx["r20"], 2) if (s20 is not None and idx["r20"] is not None) else None),
+               "rs60": (round(s60 - idx["r60"], 2) if (s60 is not None and idx["r60"] is not None) else None),
+               "ret60": (round(s60, 2) if s60 is not None else None)}
+    except Exception:
+        pass
+    _RS_CACHE[key] = (now, res); return res
+
 def _news_sentiment_one(sym_clean, market):
     """Cached single-ticker news sentiment (same store as /news-sentiment)."""
     key = market + ":" + sym_clean
@@ -6785,6 +6859,18 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
             return   # risk-OFF market — don't open new longs
         if side == "sell" and not reg.get("allow_sell", True):
             return   # risk-ON market — don't short the uptrend
+    # ── Cross-sectional relative-strength gate: buy leaders, short laggards ──
+    rs = {}
+    try:
+        rs = _rs_one(r["sym"], market) or {}
+    except Exception:
+        rs = {}
+    rs60 = rs.get("rs60")
+    if rs60 is not None:
+        if side == "buy" and rs60 <= -6:      # lagging the index by >6% over 60d — weak long
+            return
+        if side == "sell" and rs60 >= 6:       # leading the index by >6% — weak short
+            return
     # ── AI news-sentiment gate + alert context ──
     news = {}
     try:
@@ -6808,6 +6894,9 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     msg += " · %s" % tag
     if reg.get("regime") in ("risk_on", "risk_off"):
         msg += "\n🧭 %s" % reg.get("label", "")
+    if rs60 is not None:
+        msg += "\n💪 Rel. strength vs index: %+.1f%% (60d) — %s" % (
+            rs60, "leading" if rs60 > 1 else "lagging" if rs60 < -1 else "in line")
     # One-tap semi-auto: India trades get a Zerodha order link (user reviews & confirms in Kite)
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:%s" % (clean_sym, side.upper())
