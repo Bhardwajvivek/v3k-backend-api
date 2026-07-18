@@ -7284,6 +7284,129 @@ def track_record():
                     "ml_samples_logged": n_live,
                     "note": "Live results from the app's own closed trades. Small samples are noisy — treat as directional."}), 200
 
+_BT_CACHE = {}          # market -> (ts, result)
+_BT_TTL   = 6 * 3600
+_BT_H     = 10          # max holding bars
+_BT_COST  = 0.15        # round-trip cost % (brokerage + slippage), applied per trade
+
+def _backtest_symbol(sym, market, e200_idx_cache):
+    h = yf.Ticker(sym).history(period="2y", interval="1d")
+    if len(h) < 220:
+        return []
+    ic = _aligned_idx_closes(h, sym, "2y", "1d")
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
+    e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
+    e12 = _ema(c, 12); e26 = _ema(c, 26)
+    macd = [(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
+    sig = _ema([0 if x is None else x for x in macd], 9)
+    rsiS = _rsi_series(c)
+    ie200 = _ema([x if x is not None else 0 for x in ic], 200)   # index 200-DMA aligned to this stock
+    dates = list(h.index)
+    trades = []; i = 210
+    while i < len(c) - 1:
+        price = c[i]; s = 0
+        if e20[i] and e50[i]:  s += 1 if e20[i] > e50[i] else -1
+        if e50[i] and e200[i]: s += 1 if e50[i] > e200[i] else -1
+        if e20[i]:             s += 1 if price > e20[i] else -1
+        hist = (macd[i] or 0) - (sig[i] or 0); s += 1 if hist > 0 else -1
+        rv = rsiS[i]
+        if rv is not None:
+            if 52 < rv < 78: s += 1
+            elif 22 < rv < 48: s -= 1
+        dh = max(hi[i-20:i]); s += 1 if price >= dh else -1
+        if abs(s) < 6:        # high-conviction gate (max score)
+            i += 1; continue
+        dr = 1 if s > 0 else -1
+        # trend gate (price vs 200-EMA)
+        if not (e200[i] and ((dr > 0 and price > e200[i]) or (dr < 0 and price < e200[i]))):
+            i += 1; continue
+        # market-regime gate (index vs its 200-DMA)
+        if ic[i] and ie200[i]:
+            risk_on = ic[i] >= ie200[i]
+            if (dr > 0 and not risk_on) or (dr < 0 and risk_on):
+                i += 1; continue
+        # relative-strength gate (60-bar RS vs index)
+        if i >= 60 and c[i-60] and ic[i] and ic[i-60]:
+            rs60 = ((price/c[i-60]-1) - (ic[i]/ic[i-60]-1)) * 100
+            if (dr > 0 and rs60 <= -6) or (dr < 0 and rs60 >= 6):
+                i += 1; continue
+        # enter — traded profile: 0.75 ATR target / 2.0 ATR stop
+        atr = _atr_at(hi, lo, c, i) or price * 0.02
+        tgt = price + dr*0.75*atr; stp = price - dr*2.0*atr
+        outcome = None; exitp = None; held = 0
+        for k in range(i+1, min(len(c), i+1+_BT_H)):
+            held = k - i
+            if dr > 0:
+                if hi[k] >= tgt: outcome, exitp = "win", tgt; break
+                if lo[k] <= stp: outcome, exitp = "loss", stp; break
+            else:
+                if lo[k] <= tgt: outcome, exitp = "win", tgt; break
+                if hi[k] >= stp: outcome, exitp = "loss", stp; break
+        if outcome is None:
+            k = min(len(c)-1, i+_BT_H); exitp = c[k]; held = k - i
+        pnl = (exitp - price) / price * 100.0 * dr - _BT_COST   # net of costs
+        trades.append({"date": str(dates[i])[:10], "sym": sym.replace(".NS", ""),
+                       "dir": "BUY" if dr > 0 else "SELL", "pnl": round(pnl, 2), "held": held})
+        i = i + held + 1   # no overlapping trades on the same symbol
+    return trades
+
+def _strategy_backtest(market):
+    market = "us" if market == "us" else "india"
+    now = time_module.time(); c0 = _BT_CACHE.get(market)
+    if c0 and now - c0[0] < _BT_TTL:
+        return c0[1]
+    syms = _WATCH_US if market == "us" else _WATCH_IN
+    allt = []
+    for sym in syms:
+        try:
+            allt += _backtest_symbol(sym, market, {})
+        except Exception:
+            pass
+    allt.sort(key=lambda t: t["date"])
+    n = len(allt)
+    if not n:
+        res = {"market": market, "trades": 0, "note": "Not enough qualifying setups in 2y history."}
+        _BT_CACHE[market] = (now, res); return res
+    wins = [t for t in allt if t["pnl"] > 0]; pnls = [t["pnl"] for t in allt]
+    # equity curve (one position at a time, compounding) → max drawdown
+    eq = 1.0; peak = 1.0; mdd = 0.0
+    for t in allt:
+        eq *= (1 + t["pnl"]/100.0)
+        peak = max(peak, eq); mdd = min(mdd, eq/peak - 1)
+    # span in months
+    try:
+        from datetime import date
+        d0 = date.fromisoformat(allt[0]["date"]); d1 = date.fromisoformat(allt[-1]["date"])
+        months = max(1.0, (d1 - d0).days / 30.4)
+    except Exception:
+        months = 24.0
+    gross_win = sum(p for p in pnls if p > 0); gross_loss = -sum(p for p in pnls if p <= 0)
+    res = {
+        "market": market, "period": "2y", "watchlist": len(syms),
+        "trades": n, "wins": len(wins), "losses": n - len(wins),
+        "win_rate": round(len(wins)/n*100, 1),
+        "expectancy_pct": round(sum(pnls)/n, 3),          # avg net P&L per trade
+        "avg_win": round(sum(p for p in pnls if p > 0)/max(1, len(wins)), 2),
+        "avg_loss": round(sum(p for p in pnls if p <= 0)/max(1, n-len(wins)), 2),
+        "profit_factor": round(gross_win/gross_loss, 2) if gross_loss else None,
+        "total_return_pct": round((eq-1)*100, 1),         # compounded, 1 position at a time
+        "max_drawdown_pct": round(mdd*100, 1),
+        "trades_per_month": round(n/months, 1),
+        "cost_per_trade_pct": _BT_COST,
+        "buys": sum(1 for t in allt if t["dir"] == "BUY"),
+        "sells": sum(1 for t in allt if t["dir"] == "SELL"),
+        "recent": allt[-8:],
+        "note": "Full stacked strategy (conviction + trend + regime + relative strength), 0.75/2.0 ATR profile, "
+                "net of %.2f%%/trade costs. One position per symbol at a time. Past performance is not indicative "
+                "of future results." % _BT_COST,
+    }
+    _BT_CACHE[market] = (now, res); return res
+
+@app.route("/strategy-backtest", methods=["GET"])
+def strategy_backtest():
+    """Honest 2-year backtest of the FULL stacked-filter strategy. ?market=india|us (heavy; cached 6h)."""
+    return jsonify(_strategy_backtest((request.args.get("market") or "india").lower())), 200
+
 @app.route("/model/train", methods=["POST", "GET"])
 def model_train():
     """Retrain the model on the latest 2y of history (also runs in the background at startup)."""
