@@ -3043,29 +3043,6 @@ def relative_strength():
         return jsonify({"index": None, "results": {}, "error": str(e)}), 200
 
 
-@app.route("/ai-selftest", methods=["GET"])
-def ai_selftest():
-    """Diagnose the Claude wiring WITHOUT exposing the key. Reports whether the key is
-    seen by the app and what the Anthropic API actually returns for a tiny test call."""
-    info = {"key_present": bool(_ANTHROPIC_KEY), "key_len": len(_ANTHROPIC_KEY or ""),
-            "key_prefix_ok": (_ANTHROPIC_KEY or "").startswith("sk-ant-"), "model": _ANTHROPIC_MODEL}
-    if not _ANTHROPIC_KEY:
-        info["hint"] = "ANTHROPIC_API_KEY not seen — check the env var name and that Render finished redeploying."
-        return jsonify(info), 200
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages", timeout=25,
-            headers={"x-api-key": _ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": _ANTHROPIC_MODEL, "max_tokens": 16, "messages": [{"role": "user", "content": "Reply with the single word OK"}]},
-        )
-        info["api_status"] = r.status_code
-        info["api_body"] = r.text[:400]
-        info["working"] = (r.status_code == 200)
-    except Exception as e:
-        info["error"] = str(e)
-    return jsonify(info), 200
-
-
 @app.route("/news-sentiment", methods=["POST"])
 def news_sentiment():
     """AI news-sentiment per ticker. Body: {symbols:[...], market:'india'|'us'}.
