@@ -6913,9 +6913,18 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:%s" % (clean_sym, side.upper())
     opened_msgs.append(msg)
 
-_WATCH_IN = ["RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","SBIN.NS",
-             "TATAMOTORS.NS","BHARTIARTL.NS","LT.NS","AXISBANK.NS","MARUTI.NS","SUNPHARMA.NS"]
-_WATCH_US = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","JPM","NFLX","AVGO","QCOM"]
+# Broad coverage — India: Nifty 50; US: 40 large-caps (Nasdaq-100 / S&P leaders).
+_WATCH_IN = [s + ".NS" for s in [
+    "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS","SBIN","BHARTIARTL","ITC","LT","KOTAKBANK",
+    "HINDUNILVR","AXISBANK","BAJFINANCE","MARUTI","SUNPHARMA","TITAN","ASIANPAINT","ULTRACEMCO","NESTLEIND","WIPRO",
+    "ONGC","NTPC","POWERGRID","TATAMOTORS","TATASTEEL","JSWSTEEL","HCLTECH","TECHM","ADANIENT","ADANIPORTS",
+    "COALINDIA","GRASIM","HINDALCO","CIPLA","DRREDDY","BAJAJFINSV","HEROMOTOCO","EICHERMOT","BRITANNIA","TATACONSUM",
+    "APOLLOHOSP","INDUSINDBK","BPCL","SBILIFE","HDFCLIFE","LTIM","DIVISLAB","SHRIRAMFIN","BAJAJ-AUTO","M&M"]]
+_WATCH_US = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
+    "MA","UNH","HD","PG","JNJ","XOM","COST","ABBV","MRK","ADBE",
+    "AMD","NFLX","CRM","QCOM","ORCL","INTC","CSCO","PEP","KO","WMT",
+    "BAC","DIS","MCD","TXN","PYPL","UBER","PLTR","COIN","MU","NKE"]
 
 _RETRAIN_EVERY = 7 * 86400   # weekly
 
