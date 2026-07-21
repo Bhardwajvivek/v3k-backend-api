@@ -7055,10 +7055,30 @@ def _run_scan():
 
 @app.route("/cron/scan", methods=["GET", "POST"])
 def cron_scan():
+    # Record the ping so we can verify an external scheduler (cron-job.org) is hitting us.
+    try:
+        cnt = int(_kv_get("v3k_ping_count", 0) or 0) + 1
+        _kv_set("v3k_ping_count", cnt)
+        _kv_set("v3k_last_ping", time_module.time())
+    except Exception:
+        pass
     try:
         return jsonify(_run_scan())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/ping-status", methods=["GET"])
+def ping_status():
+    """Read-only: how many times /cron/scan has been pinged and how long ago the last one was.
+    Does NOT run a scan, so checking this never inflates the counter."""
+    try:
+        cnt = int(_kv_get("v3k_ping_count", 0) or 0)
+        last = float(_kv_get("v3k_last_ping", 0) or 0)
+        ago = round(time_module.time() - last, 1) if last else None
+        return jsonify({"ping_count": cnt, "last_ping_seconds_ago": ago,
+                        "awake_heartbeat_ok": (ago is not None and ago < 600)}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 200
 
 @app.route("/alerts/add", methods=["POST"])
 def alerts_add():
