@@ -7053,19 +7053,39 @@ def _run_scan():
             "retrained_now": retrained, "next_retrain_in_days": next_rt_days,
             "events": opened_msgs + closed_msgs}
 
+_scan_busy = False
+def _run_scan_bg():
+    global _scan_busy
+    if _scan_busy:
+        return
+    _scan_busy = True
+    try:
+        _run_scan()
+    except Exception:
+        pass
+    finally:
+        _scan_busy = False
+
 @app.route("/cron/scan", methods=["GET", "POST"])
 def cron_scan():
     # Record the ping so we can verify an external scheduler (cron-job.org) is hitting us.
+    cnt = None
     try:
         cnt = int(_kv_get("v3k_ping_count", 0) or 0) + 1
         _kv_set("v3k_ping_count", cnt)
         _kv_set("v3k_last_ping", time_module.time())
     except Exception:
         pass
-    try:
-        return jsonify(_run_scan())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # ?sync=1 runs the scan inline and returns full results (for debugging).
+    if request.args.get("sync") == "1":
+        try:
+            return jsonify(_run_scan())
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # Default: run the scan in the BACKGROUND so the pinger gets a fast 200 and never
+    # times out (cron-job.org/UptimeRobot cap at ~30s; a full 50-stock scan takes longer).
+    threading.Thread(target=_run_scan_bg, daemon=True).start()
+    return jsonify({"ok": True, "ping_count": cnt, "scan": "started"}), 200
 
 @app.route("/ping-status", methods=["GET"])
 def ping_status():
