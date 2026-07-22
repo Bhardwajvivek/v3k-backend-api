@@ -6970,8 +6970,10 @@ def _run_scan():
         except Exception:
             pass
 
-    # 2) INTRADAY scan (15-min) — ONLY while a market is open; skipped after close
-    if open_market:
+    # 2) INTRADAY scan — DISABLED. The 2y backtest showed intraday setups hit the stop-loss
+    #    far too often; V3K now trades SWING / POSITIONAL only (multi-day holds).
+    _INTRADAY_ENABLED = False
+    if _INTRADAY_ENABLED and open_market:
         intraday_syms = _WATCH_US if open_market == "us" else _WATCH_IN
         for sym in intraday_syms:
             try:
@@ -6981,12 +6983,11 @@ def _run_scan():
             except Exception:
                 pass
     else:
-        # Market shut → square off any open intraday trades (never held overnight)
+        # Square off any lingering intraday trades (intraday is retired).
         for t in trades:
             if t["status"] == "open" and t["kind"] == "intraday":
                 t["status"] = "session-end"; t["closed_at"] = time_module.time()
-                closed_msgs.append("🔔 Intraday auto-exit: %s squared off at market close." %
-                                   t["sym"].replace(".NS", ""))
+                closed_msgs.append("🔔 Intraday auto-exit: %s squared off." % t["sym"].replace(".NS", ""))
 
     # 3) MONITOR all open trades for 🎯 target / 🛑 stop-loss
     for t in trades:
