@@ -6047,34 +6047,53 @@ def watchlist_prices():
     Uses a browser-impersonating session to dodge Yahoo's datacenter-IP 429s and
     a short Upstash cache so a throttle window still serves last-known prices."""
     try:
+        from concurrent.futures import ThreadPoolExecutor
         data    = request.json or {}
-        symbols = data.get("symbols", [])[:30]  # cap at 30
+        symbols = data.get("symbols", [])[:40]
         prices  = {}
         cache   = _kv_get("v3k_price_cache", {}) or {}
         now_ts  = time_module.time()
         us_set = {"AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","JPM",
                   "JNJ","V","UNH","HD","PG","MA","DIS","BAC","ADBE","CRM","NFLX",
                   "INTC","AMD","QCOM","ORCL","SBUX","COIN","PYPL","UBER","PLTR","SPY","QQQ"}
+
+        # Fresh-cache fast path: serve anything fetched < 90s ago without a network hit.
+        fresh = {}
+        stale_syms = []
         for sym in symbols:
+            c = cache.get(sym)
+            if c and (now_ts - c.get("t", 0)) < 90:
+                fresh[sym] = {"price": c["price"], "change": c["change"]}
+            else:
+                stale_syms.append(sym)
+
+        def _one(sym):
+            ticker_sym = sym if (sym in us_set or "." in sym) else sym + ".NS"
             try:
-                ticker_sym = sym if (sym in us_set or "." in sym) else sym + ".NS"
                 hist = _yf_ticker(ticker_sym).history(period="2d", interval="1d")
                 if len(hist) >= 2:
                     price  = round(hist["Close"].iloc[-1], 2)
                     change = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
                 elif len(hist) == 1:
-                    price  = round(hist["Close"].iloc[-1], 2)
-                    change = 0.0
+                    price, change = round(hist["Close"].iloc[-1], 2), 0.0
                 else:
                     raise ValueError("no data")
-                prices[sym] = {"price": price, "change": change}
-                cache[sym]  = {"price": price, "change": change, "t": now_ts}
+                return sym, {"price": price, "change": change}
             except Exception:
-                # Yahoo throttled / no data → fall back to last cached value (< 6h old)
                 c = cache.get(sym)
                 if c and (now_ts - c.get("t", 0)) < 21600:
-                    prices[sym] = {"price": c["price"], "change": c["change"], "stale": True}
-                continue
+                    return sym, {"price": c["price"], "change": c["change"], "stale": True}
+                return sym, None
+
+        # Fetch the stale/missing ones in parallel (12 workers) instead of one-by-one.
+        if stale_syms:
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                for sym, val in ex.map(_one, stale_syms):
+                    if val is not None:
+                        prices[sym] = val
+                        if not val.get("stale"):
+                            cache[sym] = {"price": val["price"], "change": val["change"], "t": now_ts}
+        prices.update(fresh)
         try: _kv_set("v3k_price_cache", cache)
         except Exception: pass
         return jsonify({"prices": prices, "timestamp": datetime.now().isoformat()})
