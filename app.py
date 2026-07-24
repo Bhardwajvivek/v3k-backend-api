@@ -16,6 +16,25 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from functools import wraps
+
+# ── Anti-429: Yahoo rate-limits datacenter IPs (Render). A curl_cffi session that
+# impersonates a real Chrome browser gets past the block. Falls back gracefully if
+# curl_cffi isn't installed so the app still boots.
+_YF_SESSION = None
+try:
+    from curl_cffi import requests as _cffi_requests
+    _YF_SESSION = _cffi_requests.Session(impersonate="chrome")
+except Exception:
+    _YF_SESSION = None
+
+def _yf_ticker(sym):
+    """yf.Ticker with the impersonating session when available."""
+    try:
+        if _YF_SESSION is not None:
+            return yf.Ticker(sym, session=_YF_SESSION)
+    except Exception:
+        pass
+    return yf.Ticker(sym)
 import jwt
 import random
 import sqlite3
@@ -1647,7 +1666,7 @@ def is_market_open():
 def get_live_stock_data(symbol, period="5d", interval="15m"):
     """Get live stock data from Yahoo Finance"""
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = _yf_ticker(symbol)
         data = ticker.history(period=period, interval=interval)
         
         if data.empty:
@@ -5945,7 +5964,7 @@ def sector_performance():
         sectors = []
         for name, symbol in sector_map.items():
             try:
-                hist = yf.Ticker(symbol).history(period="2d")
+                hist = _yf_ticker(symbol).history(period="2d")
                 if len(hist) >= 2:
                     chg = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
                 elif len(hist) == 1:
@@ -5991,7 +6010,7 @@ def get_us_signals():
         signals = []
         for sym in us_tickers:
             try:
-                hist = yf.Ticker(sym).history(period="5d", interval="1d")
+                hist = _yf_ticker(sym).history(period="5d", interval="1d")
                 if len(hist) < 2:
                     continue
                 close  = hist["Close"].iloc[-1]
@@ -6024,20 +6043,22 @@ def get_us_signals():
 
 @app.route("/watchlist-prices", methods=["POST"])
 def watchlist_prices():
-    """Fetch latest price + 1-day change for a list of symbols (NSE and US)"""
+    """Fetch latest price + 1-day change for a list of symbols (NSE and US).
+    Uses a browser-impersonating session to dodge Yahoo's datacenter-IP 429s and
+    a short Upstash cache so a throttle window still serves last-known prices."""
     try:
-        import yfinance as yf
         data    = request.json or {}
         symbols = data.get("symbols", [])[:30]  # cap at 30
         prices  = {}
+        cache   = _kv_get("v3k_price_cache", {}) or {}
+        now_ts  = time_module.time()
+        us_set = {"AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","JPM",
+                  "JNJ","V","UNH","HD","PG","MA","DIS","BAC","ADBE","CRM","NFLX",
+                  "INTC","AMD","QCOM","ORCL","SBUX","COIN","PYPL","UBER","PLTR","SPY","QQQ"}
         for sym in symbols:
             try:
-                # Auto-detect NSE vs US: if no exchange suffix and not in US list, add .NS
-                us_set = {"AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","JPM",
-                          "JNJ","V","UNH","HD","PG","MA","DIS","BAC","ADBE","CRM","NFLX",
-                          "INTC","AMD","QCOM","ORCL","SBUX","COIN","PYPL","UBER","PLTR","SPY","QQQ"}
                 ticker_sym = sym if (sym in us_set or "." in sym) else sym + ".NS"
-                hist = yf.Ticker(ticker_sym).history(period="2d", interval="1d")
+                hist = _yf_ticker(ticker_sym).history(period="2d", interval="1d")
                 if len(hist) >= 2:
                     price  = round(hist["Close"].iloc[-1], 2)
                     change = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
@@ -6045,10 +6066,17 @@ def watchlist_prices():
                     price  = round(hist["Close"].iloc[-1], 2)
                     change = 0.0
                 else:
-                    continue
+                    raise ValueError("no data")
                 prices[sym] = {"price": price, "change": change}
+                cache[sym]  = {"price": price, "change": change, "t": now_ts}
             except Exception:
+                # Yahoo throttled / no data → fall back to last cached value (< 6h old)
+                c = cache.get(sym)
+                if c and (now_ts - c.get("t", 0)) < 21600:
+                    prices[sym] = {"price": c["price"], "change": c["change"], "stale": True}
                 continue
+        try: _kv_set("v3k_price_cache", cache)
+        except Exception: pass
         return jsonify({"prices": prices, "timestamp": datetime.now().isoformat()})
     except Exception as e:
         return jsonify({"error": str(e), "prices": {}}), 500
@@ -6457,7 +6485,7 @@ def _atr_last(hi, lo, c, n=14):
 
 def _signal_tf(sym, period="1y", interval="1d"):
     """Multi-factor composite (same as the frontend) on any timeframe. Returns ATR too."""
-    h = yf.Ticker(sym).history(period=period, interval=interval)
+    h = _yf_ticker(sym).history(period=period, interval=interval)
     if len(h) < 60:
         return None
     ic = _aligned_idx_closes(h, sym, period, interval)
@@ -6553,7 +6581,7 @@ def _index_hist(idx_sym, period, interval):
     if c and now - c[0] < 3600:
         return c[1]
     try:
-        h = yf.Ticker(idx_sym).history(period=period, interval=interval)
+        h = _yf_ticker(idx_sym).history(period=period, interval=interval)
     except Exception:
         h = None
     _IDX_HIST_CACHE[key] = (now, h); return h
@@ -6613,7 +6641,7 @@ def _feat_vec(c, hi, lo, vol, e20, e50, e200, macd, sig, rsiS, i, dr, ic=None):
 
 def _signal_samples(sym):
     """Build (features, win/loss) samples from 2y history for every signal bar."""
-    h = yf.Ticker(sym).history(period="2y", interval="1d")
+    h = _yf_ticker(sym).history(period="2y", interval="1d")
     if len(h) < 160: return [], []
     ic=_aligned_idx_closes(h, sym, "2y", "1d")
     c=list(h["Close"]); hi=list(h["High"]); lo=list(h["Low"]); vol=list(h["Volume"])
@@ -6759,7 +6787,7 @@ def _market_regime(market):
            "price": None, "ema200": None, "pct": None, "allow_buy": True, "allow_sell": True,
            "label": "Regime unavailable"}
     try:
-        h = yf.Ticker(_INDEX_SYM[market]).history(period="2y", interval="1d")
+        h = _yf_ticker(_INDEX_SYM[market]).history(period="2y", interval="1d")
         c = [x for x in list(h["Close"]) if x is not None]
         if len(c) >= 200:
             e200 = _ema(c, 200)
@@ -6801,7 +6829,7 @@ def _index_returns(market):
         return c[1]
     out = {"r20": None, "r60": None}
     try:
-        h = yf.Ticker(_INDEX_SYM[market]).history(period="6mo", interval="1d")
+        h = _yf_ticker(_INDEX_SYM[market]).history(period="6mo", interval="1d")
         cl = list(h["Close"]); out = {"r20": _pct_ret(cl, 20), "r60": _pct_ret(cl, 60)}
     except Exception:
         pass
@@ -6817,7 +6845,7 @@ def _rs_one(sym, market):
     res = {"rs20": None, "rs60": None, "ret60": None}
     try:
         idx = _index_returns(market)
-        h = yf.Ticker(ysym).history(period="6mo", interval="1d")
+        h = _yf_ticker(ysym).history(period="6mo", interval="1d")
         cl = list(h["Close"]); s20 = _pct_ret(cl, 20); s60 = _pct_ret(cl, 60)
         res = {"rs20": (round(s20 - idx["r20"], 2) if (s20 is not None and idx["r20"] is not None) else None),
                "rs60": (round(s60 - idx["r60"], 2) if (s60 is not None and idx["r60"] is not None) else None),
@@ -6994,7 +7022,7 @@ def _run_scan():
         if t["status"] != "open":
             continue
         try:
-            p = float(yf.Ticker(t["sym"]).history(period="1d")["Close"].iloc[-1])
+            p = float(_yf_ticker(t["sym"]).history(period="1d")["Close"].iloc[-1])
         except Exception:
             continue
         buy = t["side"] == "buy"
@@ -7025,7 +7053,7 @@ def _run_scan():
         if a.get("done"):
             continue
         try:
-            p = float(yf.Ticker(a["sym"]).history(period="1d")["Close"].iloc[-1])
+            p = float(_yf_ticker(a["sym"]).history(period="1d")["Close"].iloc[-1])
         except Exception:
             continue
         hit = None
@@ -7130,7 +7158,7 @@ def quotes():
     out = {}
     for s in syms:
         try:
-            h = yf.Ticker(s).history(period="5d")
+            h = _yf_ticker(s).history(period="5d")
             if len(h) >= 1:
                 price = float(h["Close"].iloc[-1])
                 prev = float(h["Close"].iloc[-2]) if len(h) >= 2 else price
@@ -7147,7 +7175,7 @@ def history():
     rng = request.args.get("range", "1y")
     itv = request.args.get("interval", "1d")
     try:
-        h = yf.Ticker(sym).history(period=rng, interval=itv)
+        h = _yf_ticker(sym).history(period=rng, interval=itv)
         if len(h) < 30:
             return jsonify({"error": "no data"}), 404
         return jsonify({
@@ -7167,7 +7195,7 @@ def index_chart():
     rng = request.args.get("range", "6mo")
     itv = request.args.get("interval", "1d")
     try:
-        h = yf.Ticker(sym).history(period=rng, interval=itv)
+        h = _yf_ticker(sym).history(period=rng, interval=itv)
         closes = [round(float(x), 2) for x in h["Close"] if x == x]  # drop NaN
         if len(closes) < 2:
             return jsonify({"error": "no data"}), 404
@@ -7320,7 +7348,7 @@ _BT_COST  = 0.15        # round-trip cost % (brokerage + slippage), applied per 
 
 def _backtest_symbol(sym, market, tgt_m=0.75, stp_m=2.0, H=None):
     H = H or _BT_H
-    h = yf.Ticker(sym).history(period="2y", interval="1d")
+    h = _yf_ticker(sym).history(period="2y", interval="1d")
     if len(h) < 220:
         return []
     ic = _aligned_idx_closes(h, sym, "2y", "1d")
