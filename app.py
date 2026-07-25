@@ -6057,12 +6057,14 @@ def watchlist_prices():
                   "JNJ","V","UNH","HD","PG","MA","DIS","BAC","ADBE","CRM","NFLX",
                   "INTC","AMD","QCOM","ORCL","SBUX","COIN","PYPL","UBER","PLTR","SPY","QQQ"}
 
-        # Fresh-cache fast path: serve anything fetched < 90s ago without a network hit.
+        # Fresh-cache fast path: serve anything cached < 10 min ago without a network hit.
+        # The 24/7 scan warms the sector sample every cycle, so this serves instantly and
+        # dodges Yahoo throttling; only genuinely-missing symbols are fetched live.
         fresh = {}
         stale_syms = []
         for sym in symbols:
             c = cache.get(sym)
-            if c and (now_ts - c.get("t", 0)) < 90:
+            if c and (now_ts - c.get("t", 0)) < 600:
                 fresh[sym] = {"price": c["price"], "change": c["change"]}
             else:
                 stale_syms.append(sym)
@@ -6992,9 +6994,52 @@ def _maybe_weekly_retrain():
             pass
     return False
 
+# Top-3 large-caps per sector (mirrors the frontend SECTOR_MAP sample) — these are
+# what the Sector Performance heatmap averages, so keeping them warm in the price
+# cache means the heatmap always renders instantly & reliably even when Yahoo throttles.
+_SECTOR_SAMPLE = [
+    "TCS.NS","INFY.NS","WIPRO.NS",            # IT
+    "HDFCBANK.NS","ICICIBANK.NS","SBIN.NS",   # Bank
+    "MARUTI.NS","TATAMOTORS.NS","M&M.NS",     # Auto
+    "HINDUNILVR.NS","ITC.NS","NESTLEIND.NS",  # FMCG
+    "SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS",   # Pharma
+    "RELIANCE.NS","ONGC.NS","NTPC.NS",        # Energy
+    "TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS",  # Metal
+    "BAJFINANCE.NS","BAJAJFINSV.NS","SHRIRAMFIN.NS",  # Finance
+    "LT.NS","ULTRACEMCO.NS","GRASIM.NS",      # Infra
+    "BHARTIARTL.NS","IDEA.NS","INDUSTOWER.NS",  # Telecom
+]
+
+def _warm_price_cache():
+    """Fetch the sector-sample prices and store them in the shared price cache so the
+    Sector Performance heatmap serves them instantly. Runs each scan cycle."""
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        cache  = _kv_get("v3k_price_cache", {}) or {}
+        now_ts = time_module.time()
+        def _one(sym):
+            try:
+                hist = _yf_ticker(sym).history(period="2d", interval="1d")
+                if len(hist) >= 2:
+                    price  = round(hist["Close"].iloc[-1], 2)
+                    change = round((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100, 2)
+                    return sym, {"price": price, "change": change, "t": now_ts}
+            except Exception:
+                pass
+            return sym, None
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for sym, val in ex.map(_one, _SECTOR_SAMPLE):
+                if val is not None:
+                    cache[sym] = val
+        _kv_set("v3k_price_cache", cache)
+    except Exception:
+        pass
+
 def _run_scan():
     """One scan cycle: swing + intraday trade tracking + price alerts → Telegram."""
     from datetime import timezone
+    try: _warm_price_cache()
+    except Exception: pass
     retrained = _maybe_weekly_retrain()
     _maybe_weekly_review()
     now = datetime.now(timezone.utc)
