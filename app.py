@@ -7282,12 +7282,18 @@ def model_stats():
     keys = ("ready","acc","auc","base_rate","n_train","n_test","n_live","label_profile","features","importance","trained_at")
     return jsonify({k: m[k] for k in keys if k in m})
 
+# v2 reset point (2026-08-01 UTC): the disciplined swing-only system in force now. The
+# weekly review + track record count only SWING trades opened on/after this, so they reflect
+# the current strategy rather than retired-intraday / pre-gate history. Raise after a strategy change.
+_TRACK_SINCE = 1785542400
+
 def _journal_closed():
     try:
         trades = _swings_load() or []
     except Exception:
         trades = []
-    closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")]
+    closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")
+              and t.get("kind") == "swing" and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
     for t in closed:
         e = t["entry"]; x = t.get("exit", e)
         t["_pnl"] = round(((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0), 2)
@@ -7379,7 +7385,11 @@ def track_record():
         trades = _swings_load() or []
     except Exception:
         trades = []
+    # Current-system record: SWING only, since the v2 cutoff. ?all=1 → full lifetime history.
+    show_all = request.args.get("all") == "1"
     closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")]
+    if not show_all:
+        closed = [t for t in closed if t.get("kind") == "swing" and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
     def _pnl(t):
         e = t["entry"]; x = t.get("exit", e)
         return ((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0)
@@ -7524,6 +7534,117 @@ def _strategy_backtest(market, tgt_m=0.75, stp_m=2.0, H=None):
                 "costs. One position per symbol at a time. Past performance is not indicative of future results." % _BT_COST,
     }
     _BT_CACHE[ck] = (now, res); return res
+
+# ── PARAMETER SWEEP ──────────────────────────────────────────────────────────
+# Fetch each symbol ONCE, extract the qualifying entries with their forward price
+# window, then simulate many target/stop/trailing profiles in-memory. This is how
+# we find whether ANY configuration has a real edge (profit factor > 1).
+def _sweep_entries(sym, market, H):
+    h = _yf_ticker(sym).history(period="2y", interval="1d")
+    if len(h) < 220:
+        return []
+    ic = _aligned_idx_closes(h, sym, "2y", "1d")
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+    e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
+    e12 = _ema(c, 12); e26 = _ema(c, 26)
+    macd = [(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
+    sig = _ema([0 if x is None else x for x in macd], 9)
+    rsiS = _rsi_series(c)
+    ie200 = _ema([x if x is not None else 0 for x in ic], 200)
+    entries = []; i = 210
+    while i < len(c) - 1:
+        price = c[i]; s = 0
+        if e20[i] and e50[i]:  s += 1 if e20[i] > e50[i] else -1
+        if e50[i] and e200[i]: s += 1 if e50[i] > e200[i] else -1
+        if e20[i]:             s += 1 if price > e20[i] else -1
+        hist = (macd[i] or 0) - (sig[i] or 0); s += 1 if hist > 0 else -1
+        rv = rsiS[i]
+        if rv is not None:
+            if 52 < rv < 78: s += 1
+            elif 22 < rv < 48: s -= 1
+        dh = max(hi[i-20:i]); s += 1 if price >= dh else -1
+        if abs(s) < 6: i += 1; continue
+        dr = 1 if s > 0 else -1
+        if not (e200[i] and ((dr > 0 and price > e200[i]) or (dr < 0 and price < e200[i]))):
+            i += 1; continue
+        if ic[i] and ie200[i]:
+            risk_on = ic[i] >= ie200[i]
+            if (dr > 0 and not risk_on) or (dr < 0 and risk_on): i += 1; continue
+        if i >= 60 and c[i-60] and ic[i] and ic[i-60]:
+            rs60 = ((price/c[i-60]-1) - (ic[i]/ic[i-60]-1)) * 100
+            if (dr > 0 and rs60 <= -6) or (dr < 0 and rs60 >= 6): i += 1; continue
+        atr = _atr_at(hi, lo, c, i) or price * 0.02
+        win = min(len(c), i+1+H)
+        entries.append({"dr": dr, "price": price, "atr": atr,
+                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win]})
+        i += H + 1   # non-overlapping, worst-case spacing
+    return entries
+
+def _simulate(entries, tgt_m, stp_m, trail_m):
+    """Simulate one profile over pre-extracted entries. trail_m>0 = ATR trailing stop."""
+    pnls = []
+    for e in entries:
+        dr, price, atr = e["dr"], e["price"], e["atr"]
+        tgt = price + dr*tgt_m*atr; stp = price - dr*stp_m*atr
+        best = price; outp = None
+        for k in range(len(e["fc"])):
+            hh, ll = e["fhi"][k], e["flo"][k]
+            if dr > 0:
+                if trail_m > 0: best = max(best, hh); stp = max(stp, best - trail_m*atr)
+                if hh >= tgt: outp = tgt; break
+                if ll <= stp: outp = stp; break
+            else:
+                if trail_m > 0: best = min(best, ll); stp = min(stp, best + trail_m*atr)
+                if ll <= tgt: outp = tgt; break
+                if hh >= stp: outp = stp; break
+        if outp is None:
+            outp = e["fc"][-1] if e["fc"] else price
+        pnls.append((outp - price)/price*100.0*dr - _BT_COST)
+    n = len(pnls)
+    if not n: return None
+    gw = sum(p for p in pnls if p > 0); gl = -sum(p for p in pnls if p <= 0)
+    eq = 1.0
+    for p in pnls: eq *= (1 + p/100.0)
+    return {"trades": n, "win_rate": round(sum(1 for p in pnls if p > 0)/n*100, 1),
+            "expectancy_pct": round(sum(pnls)/n, 3),
+            "profit_factor": round(gw/gl, 2) if gl else None,
+            "total_return_pct": round((eq-1)*100, 1)}
+
+_SWEEP_CACHE = {}
+@app.route("/param-sweep", methods=["GET"])
+def param_sweep():
+    """Grid-search target/stop/trailing profiles to find one with a real edge (PF>1).
+    ?market=india|us&n=<symbols>. Fetches each symbol once (cached 6h), then sims in-memory."""
+    market = "us" if request.args.get("market") == "us" else "india"
+    nsy = min(50, max(5, int(request.args.get("n", 15))))
+    ck = "%s:%d" % (market, nsy); now = time_module.time()
+    c0 = _SWEEP_CACHE.get(ck)
+    if c0 and now - c0[0] < _BT_TTL:
+        return jsonify(c0[1])
+    syms = (_WATCH_US if market == "us" else _WATCH_IN)[:nsy]
+    H = 15
+    all_entries = []
+    for sym in syms:
+        try: all_entries += _sweep_entries(sym, market, H)
+        except Exception: pass
+    if not all_entries:
+        return jsonify({"market": market, "error": "no entries — data source may be throttled"}), 200
+    grid = []
+    # target multipliers × stop multipliers × trailing (0 = fixed stop)
+    for tgt in (0.75, 1.0, 1.5, 2.0, 2.5, 3.0):
+        for stp in (1.0, 1.5, 2.0):
+            for trail in (0, 1.5, 2.5):
+                r = _simulate(all_entries, tgt, stp, trail)
+                if r: r.update({"tgt": tgt, "stp": stp, "trail": trail}); grid.append(r)
+    grid.sort(key=lambda x: (x.get("profit_factor") or 0), reverse=True)
+    profitable = [g for g in grid if (g.get("profit_factor") or 0) > 1.0]
+    res = {"market": market, "symbols": len(syms), "entries": len(all_entries),
+           "best": grid[0] if grid else None,
+           "profitable_count": len(profitable),
+           "top": grid[:8],
+           "note": "Each row = one profile over the same entries. profit_factor>1 = net-profitable in 2y backtest (0.15%/trade cost). Not a guarantee of future results."}
+    _SWEEP_CACHE[ck] = (now, res)
+    return jsonify(res)
 
 @app.route("/strategy-backtest", methods=["GET"])
 def strategy_backtest():
