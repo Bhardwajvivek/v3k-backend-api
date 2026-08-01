@@ -7065,6 +7065,16 @@ def _run_scan():
         except Exception:
             pass
 
+    # 1b) DIP-BUY scan (mean-reversion) — the one backtested-profitable edge (PF ~1.05).
+    # Buys deep oversold dips (RSI2 < 5) inside an uptrend; monitored/trailed like swings.
+    for sym in syms:
+        try:
+            mr = _meanrev_signal(sym)
+            if mr:
+                _open_meanrev_trade(mr, market, trades, opened_msgs)
+        except Exception:
+            pass
+
     # 2) INTRADAY scan — DISABLED. The 2y backtest showed intraday setups hit the stop-loss
     #    far too often; V3K now trades SWING / POSITIONAL only (multi-day holds).
     _INTRADAY_ENABLED = False
@@ -7306,7 +7316,7 @@ def _journal_closed():
     except Exception:
         trades = []
     closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")
-              and t.get("kind") == "swing" and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
+              and t.get("kind") in ("swing", "meanrev") and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
     for t in closed:
         e = t["entry"]; x = t.get("exit", e)
         t["_pnl"] = round(((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0), 2)
@@ -7402,7 +7412,7 @@ def track_record():
     show_all = request.args.get("all") == "1"
     closed = [t for t in trades if t.get("status") in ("target", "stopped") and t.get("entry")]
     if not show_all:
-        closed = [t for t in closed if t.get("kind") == "swing" and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
+        closed = [t for t in closed if t.get("kind") in ("swing", "meanrev") and (t.get("opened_at", 0) or 0) >= _TRACK_SINCE]
     def _pnl(t):
         e = t["entry"]; x = t.get("exit", e)
         return ((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0)
@@ -7691,7 +7701,70 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0):
         i += max(3, H // 3) + 1   # space entries so the same swing isn't re-counted
     return entries
 
+# ── LIVE mean-reversion signal (the one backtested-profitable edge, PF~1.05) ──
+# Long-only dip-buy: in an uptrend (price > 200-EMA) buy a deep oversold dip (RSI2 < 5).
+# Profile: 1.5 ATR target / 1.0 ATR stop / 2.0 ATR trailing. Long-only = retail-safe (no shorting).
+_MR_RSI_LO = 5.0
+def _meanrev_signal(sym):
+    """Return a live dip-buy setup dict for sym, or None. Checks the latest bar only."""
+    try:
+        h = _yf_ticker(sym).history(period="1y", interval="1d")
+        if len(h) < 210:
+            return None
+        c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+        e200 = _ema(c, 200); r2 = _rsi_series(c, 2)
+        i = len(c) - 1
+        price = c[i]; rv = r2[i]; trend = e200[i]
+        if rv is None or trend is None or not (price > trend and rv < _MR_RSI_LO):
+            return None
+        atr = _atr_at(hi, lo, c, i) or price * 0.02
+        # feature vector for ML logging (kept parallel to swing features where possible)
+        feat = {"rsi2": round(rv, 1), "atr_pct": round(atr / price * 100, 2),
+                "above200_pct": round((price / trend - 1) * 100, 2)}
+        return {"sym": sym, "type": "BUY", "score": 6, "price": round(price, 2),
+                "atr": atr, "trend_ok": True, "feat": feat, "rsi2": round(rv, 1)}
+    except Exception:
+        return None
+
+def _open_meanrev_trade(r, market, trades, opened_msgs):
+    """Open a long-only dip-buy trade (deduped) + build its Telegram alert."""
+    if any(t for t in trades if t["status"] == "open" and t["sym"] == r["sym"]
+           and t["market"] == market and t["kind"] == "meanrev"):
+        return
+    entry = r["price"]; atr = r["atr"]; clean = r["sym"].replace(".NS", "")
+    tm, sm, trail = 1.5, 1.0, 2.0
+    t1 = round(entry + tm * atr, 2); sl = round(entry - sm * atr, 2)
+    trades.append({"sym": r["sym"], "market": market, "kind": "meanrev", "side": "buy",
+                   "entry": entry, "t1": t1, "sl": sl, "status": "open",
+                   "atr": round(atr, 4), "trail": trail, "peak": entry,
+                   "feat": r.get("feat"), "opened_at": time_module.time()})
+    msg = "🎯 Dip-Buy (mean-reversion) BUY %s @ %s · 🎯 %s · 🛑 %s\n📉 RSI2 %.1f oversold in uptrend — bounce setup (backtested edge)" % (
+        clean, entry, t1, sl, r.get("rsi2", 0))
+    if market == "india":
+        msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
+    opened_msgs.append(msg)
+
 _MR_CACHE = {}
+@app.route("/meanrev/list", methods=["GET"])
+def meanrev_list():
+    """Current live dip-buy setups (fresh scan of the watchlist) + open meanrev trades."""
+    market = "us" if request.args.get("market") == "us" else "india"
+    syms = _WATCH_US if market == "us" else _WATCH_IN
+    live = []
+    for sym in syms[:40]:
+        s = _meanrev_signal(sym)
+        if s:
+            entry = s["price"]; atr = s["atr"]
+            live.append({"sym": sym.replace(".NS", ""), "price": entry, "rsi2": s["rsi2"],
+                         "t1": round(entry + 1.5*atr, 2), "sl": round(entry - 1.0*atr, 2)})
+    try:
+        opent = [t for t in (_swings_load() or []) if t.get("status") == "open" and t.get("kind") == "meanrev"]
+    except Exception:
+        opent = []
+    return jsonify({"strategy": "Dip-Buy (mean-reversion, RSI2<5 in uptrend)", "market": market,
+                    "setups": live, "open_trades": len(opent),
+                    "note": "Backtested PF ~1.05 (2y). Analytics, not advice."}), 200
+
 @app.route("/meanrev-sweep", methods=["GET"])
 def meanrev_sweep():
     """Backtest a mean-reversion strategy across profiles. ?market=&n=&h=&lo=&hi=.
