@@ -7664,6 +7664,69 @@ def param_sweep():
     _SWEEP_CACHE[ck] = (now, res)
     return jsonify(res)
 
+# ── MEAN-REVERSION STRATEGY (Connors-style) ──────────────────────────────────
+# Thesis: large-caps oscillate around trend. In an UPTREND (price > 200-EMA), a
+# sharp oversold dip (RSI2 < lo) tends to bounce; in a DOWNTREND, an overbought
+# spike (RSI2 > hi) tends to fade. Opposite edge to momentum — worth testing honestly.
+def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0):
+    h = _yf_ticker(sym).history(period="2y", interval="1d")
+    if len(h) < 220:
+        return []
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+    e200 = _ema(c, 200); r2 = _rsi_series(c, 2)
+    entries = []; i = 205
+    while i < len(c) - 1:
+        price = c[i]; rv = r2[i]; trend = e200[i]
+        if rv is None or trend is None:
+            i += 1; continue
+        dr = 0
+        if price > trend and rv < rsi_lo:      dr = 1     # oversold dip in uptrend → mean-revert long
+        elif price < trend and rv > rsi_hi:    dr = -1    # overbought spike in downtrend → mean-revert short
+        if dr == 0:
+            i += 1; continue
+        atr = _atr_at(hi, lo, c, i) or price * 0.02
+        win = min(len(c), i+1+H)
+        entries.append({"dr": dr, "price": price, "atr": atr,
+                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win]})
+        i += max(3, H // 3) + 1   # space entries so the same swing isn't re-counted
+    return entries
+
+_MR_CACHE = {}
+@app.route("/meanrev-sweep", methods=["GET"])
+def meanrev_sweep():
+    """Backtest a mean-reversion strategy across profiles. ?market=&n=&h=&lo=&hi=.
+    Mean-reversion exits are usually tight targets / wider stops — the grid finds the best."""
+    market = "us" if request.args.get("market") == "us" else "india"
+    nsy = min(50, max(5, int(request.args.get("n", 15))))
+    H   = min(30, max(3, int(request.args.get("h", 10))))
+    lo  = float(request.args.get("lo", 10)); hi = float(request.args.get("hi", 90))
+    ck = "%s:%d:%d:%.0f:%.0f" % (market, nsy, H, lo, hi); now = time_module.time()
+    c0 = _MR_CACHE.get(ck)
+    if c0 and now - c0[0] < _BT_TTL:
+        return jsonify(c0[1])
+    syms = (_WATCH_US if market == "us" else _WATCH_IN)[:nsy]
+    all_entries = []
+    for sym in syms:
+        try: all_entries += _meanrev_entries(sym, market, H, lo, hi)
+        except Exception: pass
+    if not all_entries:
+        return jsonify({"market": market, "error": "no entries — data throttled or none qualified"}), 200
+    grid = []
+    for tgt in (0.5, 0.75, 1.0, 1.5, 2.0):        # reversion target (usually tight)
+        for stp in (1.0, 1.5, 2.0, 3.0):           # stop (usually wider)
+            for trail in (0, 2.0, 3.0):
+                r = _simulate(all_entries, tgt, stp, trail)
+                if r: r.update({"tgt": tgt, "stp": stp, "trail": trail}); grid.append(r)
+    grid.sort(key=lambda x: (x.get("profit_factor") or 0), reverse=True)
+    res = {"strategy": "mean-reversion (RSI2 %g/%g, 200-EMA trend filter)" % (lo, hi),
+           "market": market, "symbols": len(syms), "entries": len(all_entries),
+           "best": grid[0] if grid else None,
+           "profitable_count": sum(1 for g in grid if (g.get("profit_factor") or 0) > 1.0),
+           "top": grid[:8],
+           "note": "2y backtest, 0.15%/trade cost. profit_factor>1 = net-profitable. Not a guarantee of future results."}
+    _MR_CACHE[ck] = (now, res)
+    return jsonify(res)
+
 @app.route("/strategy-backtest", methods=["GET"])
 def strategy_backtest():
     """Honest 2-year backtest of the FULL stacked-filter strategy. ?market=india|us
