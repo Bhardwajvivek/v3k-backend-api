@@ -6940,11 +6940,14 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
         return   # recent news strongly conflicts with the setup — skip it
     d = 1 if side == "buy" else -1
     entry = r["price"]; atr = r["atr"]
-    # Positive risk:reward profile (2y backtested profitable): India 2.5/1.5 ATR, US 2.0/1.0 ATR.
-    tm, sm = (2.0, 1.0) if market == "us" else (2.5, 1.5)
+    # v2 profile (best of 54-combo 2y sweep): 1.0 ATR target / 2.0 ATR initial stop +
+    # a 2.5 ATR TRAILING stop so winners ride the trend. Highest win-rate (~66%) and
+    # closest-to-breakeven profile found; still analytics, not a profit guarantee.
+    tm, sm, trail = 1.0, 2.0, 2.5
     t1 = round(entry + d * tm * atr, 2); sl = round(entry - d * sm * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
                    "entry": entry, "t1": t1, "sl": sl, "status": "open",
+                   "atr": round(atr, 4), "trail": trail, "peak": entry,
                    "feat": r.get("feat"), "opened_at": time_module.time()})
     msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" % (kind.title(), side.upper(), clean_sym, entry, t1, sl)
     emoji = "📈" if nlabel == "bullish" else "📉" if nlabel == "bearish" else "📰"
@@ -7090,6 +7093,16 @@ def _run_scan():
         except Exception:
             continue
         buy = t["side"] == "buy"
+        # Trailing stop: ratchet the stop toward price as the trade moves in our favour,
+        # so winners ride the trend instead of capping at a fixed target.
+        atr = t.get("atr"); trail = t.get("trail")
+        if atr and trail:
+            if buy:
+                t["peak"] = max(t.get("peak", t["entry"]), p)
+                t["sl"] = round(max(t["sl"], t["peak"] - trail * atr), 4)
+            else:
+                t["peak"] = min(t.get("peak", t["entry"]), p)
+                t["sl"] = round(min(t["sl"], t["peak"] + trail * atr), 4)
         hit_t = (p >= t["t1"]) if buy else (p <= t["t1"])
         hit_s = (p <= t["sl"]) if buy else (p >= t["sl"])
         pnl = ((p - t["entry"]) / t["entry"] * 100) if buy else ((t["entry"] - p) / t["entry"] * 100)
@@ -7599,7 +7612,11 @@ def _simulate(entries, tgt_m, stp_m, trail_m):
                 if hh >= stp: outp = stp; break
         if outp is None:
             outp = e["fc"][-1] if e["fc"] else price
-        pnls.append((outp - price)/price*100.0*dr - _BT_COST)
+        if outp is None or price in (None, 0):
+            continue
+        pl = (outp - price)/price*100.0*dr - _BT_COST
+        if pl == pl and abs(pl) < 1e6:   # skip NaN/inf
+            pnls.append(pl)
     n = len(pnls)
     if not n: return None
     gw = sum(p for p in pnls if p > 0); gl = -sum(p for p in pnls if p <= 0)
@@ -7617,12 +7634,12 @@ def param_sweep():
     ?market=india|us&n=<symbols>. Fetches each symbol once (cached 6h), then sims in-memory."""
     market = "us" if request.args.get("market") == "us" else "india"
     nsy = min(50, max(5, int(request.args.get("n", 15))))
-    ck = "%s:%d" % (market, nsy); now = time_module.time()
+    H = min(90, max(10, int(request.args.get("h", 15))))    # holding window (bars) — longer = trend-ride
+    ck = "%s:%d:%d" % (market, nsy, H); now = time_module.time()
     c0 = _SWEEP_CACHE.get(ck)
     if c0 and now - c0[0] < _BT_TTL:
         return jsonify(c0[1])
     syms = (_WATCH_US if market == "us" else _WATCH_IN)[:nsy]
-    H = 15
     all_entries = []
     for sym in syms:
         try: all_entries += _sweep_entries(sym, market, H)
@@ -7630,10 +7647,11 @@ def param_sweep():
     if not all_entries:
         return jsonify({"market": market, "error": "no entries — data source may be throttled"}), 200
     grid = []
-    # target multipliers × stop multipliers × trailing (0 = fixed stop)
-    for tgt in (0.75, 1.0, 1.5, 2.0, 2.5, 3.0):
-        for stp in (1.0, 1.5, 2.0):
-            for trail in (0, 1.5, 2.5):
+    # target multipliers × stop multipliers × trailing (0 = fixed stop).
+    # tgt 6.0/10.0 ≈ "let it ride" — exit only on the trailing stop (trend-following).
+    for tgt in (0.75, 1.0, 1.5, 2.0, 3.0, 6.0, 10.0):
+        for stp in (1.0, 1.5, 2.0, 3.0):
+            for trail in (0, 1.5, 2.5, 4.0):
                 r = _simulate(all_entries, tgt, stp, trail)
                 if r: r.update({"tgt": tgt, "stp": stp, "trail": trail}); grid.append(r)
     grid.sort(key=lambda x: (x.get("profit_factor") or 0), reverse=True)
