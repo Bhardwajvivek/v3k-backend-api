@@ -7678,20 +7678,28 @@ def param_sweep():
 # Thesis: large-caps oscillate around trend. In an UPTREND (price > 200-EMA), a
 # sharp oversold dip (RSI2 < lo) tends to bounce; in a DOWNTREND, an overbought
 # spike (RSI2 > hi) tends to fade. Opposite edge to momentum — worth testing honestly.
-def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0):
+def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, volx=0.0):
     h = _yf_ticker(sym).history(period="2y", interval="1d")
     if len(h) < 220:
         return []
-    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
-    e200 = _ema(c, 200); r2 = _rsi_series(c, 2)
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
+    e200 = _ema(c, 200); e50 = _ema(c, 50); r2 = _rsi_series(c, 2)
     entries = []; i = 205
     while i < len(c) - 1:
-        price = c[i]; rv = r2[i]; trend = e200[i]
+        price = c[i]; rv = r2[i]; trend = e200[i]; m50 = e50[i]
         if rv is None or trend is None:
             i += 1; continue
+        # strict = require a CONFIRMED strong trend (50-EMA on the trend side of 200-EMA)
+        up_ok = (price > trend) and (not strict or (m50 is not None and m50 > trend))
+        dn_ok = (price < trend) and (not strict or (m50 is not None and m50 < trend))
+        # volx = require volume spike (capitulation): today's vol > volx × 20-day avg
+        if volx > 0:
+            av = _sma_at(vol, 20, i)
+            if not (av and vol[i] > volx * av):
+                i += 1; continue
         dr = 0
-        if price > trend and rv < rsi_lo:      dr = 1     # oversold dip in uptrend → mean-revert long
-        elif price < trend and rv > rsi_hi:    dr = -1    # overbought spike in downtrend → mean-revert short
+        if up_ok and rv < rsi_lo:      dr = 1     # oversold dip in uptrend → mean-revert long
+        elif dn_ok and rv > rsi_hi:    dr = -1    # overbought spike in downtrend → mean-revert short
         if dr == 0:
             i += 1; continue
         atr = _atr_at(hi, lo, c, i) or price * 0.02
@@ -7773,14 +7781,15 @@ def meanrev_sweep():
     nsy = min(50, max(5, int(request.args.get("n", 15))))
     H   = min(30, max(3, int(request.args.get("h", 10))))
     lo  = float(request.args.get("lo", 10)); hi = float(request.args.get("hi", 90))
-    ck = "%s:%d:%d:%.0f:%.0f" % (market, nsy, H, lo, hi); now = time_module.time()
+    strict = request.args.get("strict") == "1"; volx = float(request.args.get("volx", 0))
+    ck = "%s:%d:%d:%.0f:%.0f:%d:%.1f" % (market, nsy, H, lo, hi, int(strict), volx); now = time_module.time()
     c0 = _MR_CACHE.get(ck)
     if c0 and now - c0[0] < _BT_TTL:
         return jsonify(c0[1])
     syms = (_WATCH_US if market == "us" else _WATCH_IN)[:nsy]
     all_entries = []
     for sym in syms:
-        try: all_entries += _meanrev_entries(sym, market, H, lo, hi)
+        try: all_entries += _meanrev_entries(sym, market, H, lo, hi, strict, volx)
         except Exception: pass
     if not all_entries:
         return jsonify({"market": market, "error": "no entries — data throttled or none qualified"}), 200
