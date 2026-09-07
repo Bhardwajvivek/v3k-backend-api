@@ -6217,6 +6217,60 @@ def _tg_send(text, chat=None):
     except Exception:
         pass
 
+# ── PER-USER TELEGRAM ALERTS ─────────────────────────────────────────────────
+# Any user connects their own Telegram (one-tap claim), then receives the signal
+# feed too — not just the owner. Subscribers persist in Upstash.
+def _tg_subs():        return _kv_get("v3k_tg_subs", []) or []
+def _tg_subs_save(s):  _kv_set("v3k_tg_subs", s[-2000:])
+def _tg_send_all(text):
+    """Send to the owner + every subscribed user."""
+    seen = set()
+    for cid in [TG_CHAT] + [s.get("chat_id") for s in _tg_subs()]:
+        cid = str(cid or "")
+        if cid and cid not in seen:
+            seen.add(cid); _tg_send(text, cid)
+
+@app.route("/telegram/claim", methods=["GET"])
+def telegram_claim():
+    """Bind a user's Telegram: they send a one-time CODE to the bot, we find their chat via
+    getUpdates and subscribe it. ?code=&email="""
+    code = (request.args.get("code") or "").strip()
+    email = (request.args.get("email") or "").strip().lower()
+    if not code:
+        return jsonify({"ok": False, "error": "missing code"}), 400
+    try:
+        r = requests.get("https://api.telegram.org/bot%s/getUpdates" % TG_TOKEN, timeout=12)
+        ups = (r.json() or {}).get("result", []) if r.status_code == 200 else []
+    except Exception as e:
+        return jsonify({"ok": False, "error": "telegram unreachable"}), 502
+    chat_id = None; name = ""
+    for u in reversed(ups):                      # newest first
+        msg = u.get("message") or u.get("edited_message") or {}
+        if code.lower() in str(msg.get("text", "")).lower():
+            ch = msg.get("chat") or {}
+            chat_id = ch.get("id"); name = (ch.get("first_name") or "") + " " + (ch.get("last_name") or "")
+            break
+    if not chat_id:
+        return jsonify({"ok": False, "error": "code not found — send the exact code to the bot, then tap Verify again"}), 404
+    subs = [s for s in _tg_subs() if str(s.get("chat_id")) != str(chat_id)]
+    subs.append({"chat_id": chat_id, "email": email, "name": name.strip(), "ts": time_module.time()})
+    _tg_subs_save(subs)
+    _tg_send("✅ You're connected to V3K signals! You'll now receive high-confidence trade alerts here. Reply STOP in the app to unsubscribe.", chat_id)
+    return jsonify({"ok": True, "name": name.strip()}), 200
+
+@app.route("/telegram/status", methods=["GET"])
+def telegram_status():
+    email = (request.args.get("email") or "").strip().lower()
+    sub = next((s for s in _tg_subs() if (s.get("email") or "").lower() == email), None)
+    return jsonify({"subscribed": bool(sub), "name": (sub or {}).get("name", ""), "total": len(_tg_subs())}), 200
+
+@app.route("/telegram/unsubscribe", methods=["POST"])
+def telegram_unsub():
+    email = ((request.json or {}).get("email") or "").strip().lower()
+    subs = [s for s in _tg_subs() if (s.get("email") or "").lower() != email]
+    _tg_subs_save(subs)
+    return jsonify({"ok": True}), 200
+
 # ── Persistent storage: Upstash Redis (free) via REST if configured, else local file.
 # Render's free disk is EPHEMERAL — wiped on every restart/redeploy — which erased open
 # trades before they could hit target/SL (no exit alerts) and emptied the report. When the
@@ -7223,7 +7277,7 @@ def _run_scan():
                                (t["sym"].replace(".NS", ""), t["side"].upper(), t["kind"], pnl, t["entry"], p))
 
     for m in opened_msgs + closed_msgs:
-        _tg_send("V3K: " + m)
+        _tg_send_all("V3K: " + m)          # broadcast to owner + all subscribed users
     # keep open + a long history of closed trades (for the Reports tab)
     trades = [t for t in trades if t["status"] == "open"] + \
              [t for t in trades if t["status"] != "open"][-200:]
