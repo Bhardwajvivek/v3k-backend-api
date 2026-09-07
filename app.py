@@ -7874,12 +7874,21 @@ def profile():
         if (data.get("owner_email", "") or "").strip().lower() != OWNER:
             return jsonify({"error": "not authorised"}), 403
         prof = {k: (data.get(k, "") or "") for k in ("brand", "name", "role", "email", "phone", "tagline", "photo")}
+        # If phone left blank on edit (client never sees the full number), keep the existing one.
+        if not "".join(ch for ch in str(prof.get("phone", "")) if ch.isdigit()):
+            prev = _kv_get("v3k_profile_public", {}) or {}
+            prof["phone"] = prev.get("phone", "")
         try:
             _kv_set("v3k_profile_public", prof)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
         return jsonify({"ok": True}), 200
-    return jsonify(_kv_get("v3k_profile_public", {}) or {}), 200
+    # GET: return the profile with the phone MASKED to its last 4 digits so the full
+    # number never leaves the server. Owner re-types the full number when editing.
+    prof = dict(_kv_get("v3k_profile_public", {}) or {})
+    ph = "".join(ch for ch in str(prof.get("phone", "")) if ch.isdigit())
+    prof["phone"] = ("•" * max(4, len(ph) - 4) + ph[-4:]) if len(ph) >= 4 else ""
+    return jsonify(prof), 200
 
 @app.route("/ensemble", methods=["GET"])
 def ensemble():
