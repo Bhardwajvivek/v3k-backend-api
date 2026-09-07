@@ -6902,7 +6902,38 @@ _NEWS_VETO = 0.4
 _CONF_GATE            = 70     # minimum confidence (0–100) to send an alert
 _MAX_ALERTS_PER_SCAN  = 3      # hard cap — never blast a bulk of signals at once
 _SIDE_STATS           = {}     # live long/short win-rates, refreshed each scan
+_STRAT_STATS          = {}     # ENSEMBLE: per-strategy live weights, refreshed each scan
 _scan_alerts          = 0      # alerts emitted this scan (reset per scan)
+
+def _strategy_stats(recent=40):
+    """ENSEMBLE META-MODEL. Blends the strategies by their RECENT live performance: each
+    strategy earns a weight (0–1.5) from its last ~40 closed trades' win-rate & expectancy.
+    A winning strategy gets more airtime; a losing one is suppressed toward silence — the
+    platform re-allocates conviction to whatever is actually working, automatically."""
+    try:
+        trades = _swings_load() or []
+    except Exception:
+        return {}
+    closed = [t for t in trades if t.get("status") in ("target", "stopped")
+              and t.get("kind") in ("swing", "meanrev") and t.get("entry")]
+    closed = closed[-max(20, recent * 2):]      # recent window = current behaviour
+    def _pnl(t):
+        e = t["entry"]; x = t.get("exit", e)
+        return ((x - e) / e * 100.0) if t.get("side") == "buy" else ((e - x) / e * 100.0)
+    out = {}
+    for k in ("swing", "meanrev"):
+        rows = [t for t in closed if t.get("kind") == k][-recent:]
+        n = len(rows)
+        if n >= 5:
+            w = sum(1 for t in rows if t.get("status") == "target")
+            wr = w / n * 100.0
+            exp = sum(_pnl(t) for t in rows) / n
+            # weight: 1.0 neutral; expectancy dominates, win-rate nudges. Clamped 0–1.5.
+            weight = max(0.0, min(1.5, 1.0 + exp * 0.25 + (wr - 50.0) * 0.006))
+            out[k] = {"n": n, "wr": round(wr, 1), "exp": round(exp, 3), "weight": round(weight, 2)}
+        else:
+            out[k] = {"n": n, "wr": None, "exp": None, "weight": 1.0}   # unproven → neutral, not silenced
+    return out
 
 def _live_side_stats():
     """Live per-side win-rate from CLOSED swing+meanrev trades. This is the learning
@@ -6922,9 +6953,10 @@ def _live_side_stats():
             out[side] = {"n": n, "wr": round(w / n * 100.0, 1)}
     return out
 
-def _signal_confidence(score, side, reg, rs60, nscore):
+def _signal_confidence(score, side, reg, rs60, nscore, kind="swing"):
     """0–100 confidence. Conviction strength + regime/relative-strength/news alignment +
-    the side's LIVE win-rate (adaptive). High bar = few, high-quality alerts."""
+    the side's LIVE win-rate + the ensemble strategy weight (all adaptive). High bar = few,
+    high-quality alerts, re-weighted toward whatever is actually working."""
     conf = 44.0
     conf += min(14.0, (abs(score) - 5) * 6.0)                       # conviction strength
     if reg.get("regime") in ("risk_on", "risk_off"):
@@ -6937,6 +6969,9 @@ def _signal_confidence(score, side, reg, rs60, nscore):
     ss = _SIDE_STATS.get(side)                                      # ADAPTIVE: favour what's winning live
     if ss:
         conf += max(-18.0, min(18.0, (ss["wr"] - 50.0) * 0.7))
+    st = _STRAT_STATS.get(kind)                                     # ENSEMBLE: weight by recent live perf
+    if st:
+        conf += max(-20.0, min(12.0, (st["weight"] - 1.0) * 24.0))
     return int(max(0, min(100, round(conf))))
 
 def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
@@ -6986,7 +7021,7 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
         return   # recent news strongly conflicts with the setup — skip it
     # ── QUALITY GATE: only alert on the platform's most-confident setups, never in bulk ──
     global _scan_alerts
-    conf = _signal_confidence(r["score"], side, reg, rs60, nscore)
+    conf = _signal_confidence(r["score"], side, reg, rs60, nscore, kind)
     if conf < _CONF_GATE:
         return                                  # not confident enough — stay silent
     if _scan_alerts >= _MAX_ALERTS_PER_SCAN:
@@ -7108,9 +7143,10 @@ def _run_scan():
     open_market = _market_open_now()   # 'india' | 'us' | None
     trades = _swings_load()
     opened_msgs, closed_msgs = [], []
-    # Refresh adaptive learning (live per-side win-rates) + reset the per-scan alert cap.
-    global _SIDE_STATS, _scan_alerts
+    # Refresh adaptive learning (per-side win-rates + ensemble strategy weights) + reset cap.
+    global _SIDE_STATS, _STRAT_STATS, _scan_alerts
     _SIDE_STATS = _live_side_stats()
+    _STRAT_STATS = _strategy_stats()
     _scan_alerts = 0
 
     # 1) SWING scan (daily) — a new strong signal opens ONE swing trade.
@@ -7806,6 +7842,9 @@ def _open_meanrev_trade(r, market, trades, opened_msgs):
     ss = _SIDE_STATS.get("buy")
     if ss:
         conf += max(-12.0, min(12.0, (ss["wr"] - 50.0) * 0.6))
+    st = _STRAT_STATS.get("meanrev")                             # ENSEMBLE weight
+    if st:
+        conf += max(-20.0, min(12.0, (st["weight"] - 1.0) * 24.0))
     conf = int(max(0, min(100, round(conf))))
     if conf < _CONF_GATE:
         return
@@ -7824,6 +7863,22 @@ def _open_meanrev_trade(r, market, trades, opened_msgs):
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
     opened_msgs.append(msg)
+
+@app.route("/ensemble", methods=["GET"])
+def ensemble():
+    """Transparent view of the adaptive ensemble: how the platform is currently weighting
+    each strategy & side based on their RECENT live results. This is the learning, visible."""
+    strat = _strategy_stats(); side = _live_side_stats()
+    def _lean(st):
+        w = (st or {}).get("weight", 1.0)
+        return "boosted" if w > 1.08 else "suppressed" if w < 0.92 else "neutral"
+    return jsonify({
+        "strategies": {k: {**v, "lean": _lean(v)} for k, v in strat.items()},
+        "sides": side,
+        "gate": _CONF_GATE, "max_alerts_per_scan": _MAX_ALERTS_PER_SCAN,
+        "note": "Weights (0–1.5) come from each strategy's recent closed trades. >1 = winning "
+                "→ more airtime; <1 = losing → suppressed toward silence. Updates every scan."
+    }), 200
 
 _MR_CACHE = {}
 @app.route("/meanrev/list", methods=["GET"])
