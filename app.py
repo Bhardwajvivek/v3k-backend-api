@@ -6893,9 +6893,55 @@ def _news_sentiment_one(sym_clean, market):
 # News strongly opposing the trade direction vetoes the signal (|score| ≥ this).
 _NEWS_VETO = 0.4
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIGNAL QUALITY GATE + ADAPTIVE LEARNING  (owner directive: quality > quantity)
+#  Only the signals the platform is genuinely MOST confident in are alerted — never
+#  in bulk. Confidence also learns from live results: the side (long/short) and
+#  strategy that are actually winning get boosted; the losing side gets suppressed.
+# ══════════════════════════════════════════════════════════════════════════════
+_CONF_GATE            = 70     # minimum confidence (0–100) to send an alert
+_MAX_ALERTS_PER_SCAN  = 3      # hard cap — never blast a bulk of signals at once
+_SIDE_STATS           = {}     # live long/short win-rates, refreshed each scan
+_scan_alerts          = 0      # alerts emitted this scan (reset per scan)
+
+def _live_side_stats():
+    """Live per-side win-rate from CLOSED swing+meanrev trades. This is the learning
+    signal: the reviews show shorts win ~77% but longs only ~49% — so the platform
+    should lean toward whichever side is actually working, and it does, via confidence."""
+    try:
+        trades = _swings_load() or []
+    except Exception:
+        return {}
+    out = {}
+    for side in ("buy", "sell"):
+        rows = [t for t in trades if t.get("side") == side and t.get("status") in ("target", "stopped")
+                and t.get("kind") in ("swing", "meanrev")]
+        n = len(rows)
+        if n >= 5:
+            w = sum(1 for t in rows if t.get("status") == "target")
+            out[side] = {"n": n, "wr": round(w / n * 100.0, 1)}
+    return out
+
+def _signal_confidence(score, side, reg, rs60, nscore):
+    """0–100 confidence. Conviction strength + regime/relative-strength/news alignment +
+    the side's LIVE win-rate (adaptive). High bar = few, high-quality alerts."""
+    conf = 44.0
+    conf += min(14.0, (abs(score) - 5) * 6.0)                       # conviction strength
+    if reg.get("regime") in ("risk_on", "risk_off"):
+        aligned = (side == "buy" and reg.get("allow_buy", True)) or (side == "sell" and reg.get("allow_sell", True))
+        conf += 10 if aligned else -8
+    if rs60 is not None and ((side == "buy" and rs60 > 1) or (side == "sell" and rs60 < -1)):
+        conf += 8                                                   # leader long / laggard short
+    if (side == "buy" and nscore > 0.15) or (side == "sell" and nscore < -0.15):
+        conf += 8                                                   # news tailwind
+    ss = _SIDE_STATS.get(side)                                      # ADAPTIVE: favour what's winning live
+    if ss:
+        conf += max(-18.0, min(18.0, (ss["wr"] - 50.0) * 0.7))
+    return int(max(0, min(100, round(conf))))
+
 def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
-    """Open ONLY high-conviction, trend-aligned signals (score 6, max) with the profitable
-    tight-target (0.75 ATR) / wide-stop (2.0 ATR) profile — fewer, higher win-rate trades.
+    """Open ONLY high-conviction, trend-aligned signals that also clear the confidence
+    gate (quality > quantity — the platform stays silent unless it's genuinely confident).
     A news-sentiment gate additionally vetoes setups whose recent news strongly opposes them."""
     if abs(r["score"]) < 6 or r["type"] == "NEUTRAL":
         return
@@ -6938,6 +6984,14 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     nlabel = news.get("label", "neutral"); nscore = float(news.get("score", 0) or 0)
     if (side == "buy" and nscore <= -_NEWS_VETO) or (side == "sell" and nscore >= _NEWS_VETO):
         return   # recent news strongly conflicts with the setup — skip it
+    # ── QUALITY GATE: only alert on the platform's most-confident setups, never in bulk ──
+    global _scan_alerts
+    conf = _signal_confidence(r["score"], side, reg, rs60, nscore)
+    if conf < _CONF_GATE:
+        return                                  # not confident enough — stay silent
+    if _scan_alerts >= _MAX_ALERTS_PER_SCAN:
+        return                                  # already sent the best few — no bulk
+    _scan_alerts += 1
     d = 1 if side == "buy" else -1
     entry = r["price"]; atr = r["atr"]
     # v2 profile (best of 54-combo 2y sweep): 1.0 ATR target / 2.0 ATR initial stop +
@@ -6946,10 +7000,11 @@ def _open_or_check_trade(r, market, kind, trades, opened_msgs, closed_msgs):
     tm, sm, trail = 1.0, 2.0, 2.5
     t1 = round(entry + d * tm * atr, 2); sl = round(entry - d * sm * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": kind, "side": side,
-                   "entry": entry, "t1": t1, "sl": sl, "status": "open",
+                   "entry": entry, "t1": t1, "sl": sl, "status": "open", "conf": conf,
                    "atr": round(atr, 4), "trail": trail, "peak": entry,
                    "feat": r.get("feat"), "opened_at": time_module.time()})
-    msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s" % (kind.title(), side.upper(), clean_sym, entry, t1, sl)
+    msg = "📌 %s %s %s @ %s · 🎯 %s · 🛑 %s\n✅ Confidence %d%% (high-conviction only)" % (
+        kind.title(), side.upper(), clean_sym, entry, t1, sl, conf)
     emoji = "📈" if nlabel == "bullish" else "📉" if nlabel == "bearish" else "📰"
     tag = "🤖 AI" if news.get("engine") == "claude" else "📰"
     reason = (news.get("reason") or "").strip()
@@ -7053,6 +7108,10 @@ def _run_scan():
     open_market = _market_open_now()   # 'india' | 'us' | None
     trades = _swings_load()
     opened_msgs, closed_msgs = [], []
+    # Refresh adaptive learning (live per-side win-rates) + reset the per-scan alert cap.
+    global _SIDE_STATS, _scan_alerts
+    _SIDE_STATS = _live_side_stats()
+    _scan_alerts = 0
 
     # 1) SWING scan (daily) — a new strong signal opens ONE swing trade.
     # The single alert per stock comes from _open_or_check_trade (deduped by the
@@ -7735,19 +7794,33 @@ def _meanrev_signal(sym):
         return None
 
 def _open_meanrev_trade(r, market, trades, opened_msgs):
-    """Open a long-only dip-buy trade (deduped) + build its Telegram alert."""
+    """Open a long-only dip-buy trade (deduped) + build its Telegram alert — subject to the
+    same confidence gate + per-scan cap so only the most-confident dips are ever alerted."""
+    global _scan_alerts
     if any(t for t in trades if t["status"] == "open" and t["sym"] == r["sym"]
            and t["market"] == market and t["kind"] == "meanrev"):
         return
+    # QUALITY GATE — dip-buy is the one backtested-profitable edge (PF~1.05), so it earns a
+    # solid base; deeper oversold (lower RSI2) lifts it; live long win-rate nudges it.
+    conf = 66.0 + max(0.0, (5.0 - r.get("rsi2", 5))) * 3.0        # rsi2 5→+0, 2→+9, 0→+15
+    ss = _SIDE_STATS.get("buy")
+    if ss:
+        conf += max(-12.0, min(12.0, (ss["wr"] - 50.0) * 0.6))
+    conf = int(max(0, min(100, round(conf))))
+    if conf < _CONF_GATE:
+        return
+    if _scan_alerts >= _MAX_ALERTS_PER_SCAN:
+        return
+    _scan_alerts += 1
     entry = r["price"]; atr = r["atr"]; clean = r["sym"].replace(".NS", "")
     tm, sm, trail = 1.5, 1.0, 2.0
     t1 = round(entry + tm * atr, 2); sl = round(entry - sm * atr, 2)
     trades.append({"sym": r["sym"], "market": market, "kind": "meanrev", "side": "buy",
-                   "entry": entry, "t1": t1, "sl": sl, "status": "open",
+                   "entry": entry, "t1": t1, "sl": sl, "status": "open", "conf": conf,
                    "atr": round(atr, 4), "trail": trail, "peak": entry,
                    "feat": r.get("feat"), "opened_at": time_module.time()})
-    msg = "🎯 Dip-Buy (mean-reversion) BUY %s @ %s · 🎯 %s · 🛑 %s\n📉 RSI2 %.1f oversold in uptrend — bounce setup (backtested edge)" % (
-        clean, entry, t1, sl, r.get("rsi2", 0))
+    msg = "🎯 Dip-Buy (mean-reversion) BUY %s @ %s · 🎯 %s · 🛑 %s\n✅ Confidence %d%% · 📉 RSI2 %.1f oversold in uptrend (backtested edge)" % (
+        clean, entry, t1, sl, conf, r.get("rsi2", 0))
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
     opened_msgs.append(msg)
@@ -7758,13 +7831,21 @@ def meanrev_list():
     """Current live dip-buy setups (fresh scan of the watchlist) + open meanrev trades."""
     market = "us" if request.args.get("market") == "us" else "india"
     syms = _WATCH_US if market == "us" else _WATCH_IN
+    ss = _live_side_stats().get("buy")
+    def _mr_conf(rsi2):
+        conf = 66.0 + max(0.0, (5.0 - rsi2)) * 3.0
+        if ss: conf += max(-12.0, min(12.0, (ss["wr"] - 50.0) * 0.6))
+        return int(max(0, min(100, round(conf))))
     live = []
     for sym in syms[:40]:
         s = _meanrev_signal(sym)
         if s:
-            entry = s["price"]; atr = s["atr"]
-            live.append({"sym": sym.replace(".NS", ""), "price": entry, "rsi2": s["rsi2"],
+            entry = s["price"]; atr = s["atr"]; conf = _mr_conf(s["rsi2"])
+            if conf < _CONF_GATE:      # quality gate — only show what we'd actually alert
+                continue
+            live.append({"sym": sym.replace(".NS", ""), "price": entry, "rsi2": s["rsi2"], "conf": conf,
                          "t1": round(entry + 1.5*atr, 2), "sl": round(entry - 1.0*atr, 2)})
+    live.sort(key=lambda x: -x["conf"])
     try:
         opent = [t for t in (_swings_load() or []) if t.get("status") == "open" and t.get("kind") == "meanrev"]
     except Exception:
