@@ -7864,6 +7864,23 @@ def _open_meanrev_trade(r, market, trades, opened_msgs):
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
     opened_msgs.append(msg)
 
+@app.route("/profile", methods=["GET", "POST"])
+def profile():
+    """Owner profile / contact card, synced across all devices & users via Upstash.
+    GET returns the public profile; POST (owner-only) saves it."""
+    OWNER = "bhardwajvivek.v3@gmail.com"
+    if request.method == "POST":
+        data = request.json or {}
+        if (data.get("owner_email", "") or "").strip().lower() != OWNER:
+            return jsonify({"error": "not authorised"}), 403
+        prof = {k: (data.get(k, "") or "") for k in ("brand", "name", "role", "email", "phone", "tagline", "photo")}
+        try:
+            _kv_set("v3k_profile_public", prof)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": True}), 200
+    return jsonify(_kv_get("v3k_profile_public", {}) or {}), 200
+
 @app.route("/ensemble", methods=["GET"])
 def ensemble():
     """Transparent view of the adaptive ensemble: how the platform is currently weighting
