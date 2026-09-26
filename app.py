@@ -7771,7 +7771,7 @@ def _sweep_entries(sym, market, H):
     if len(h) < 220:
         return []
     ic = _aligned_idx_closes(h, sym, "2y", "1d")
-    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); op = list(h["Open"])
     e20 = _ema(c, 20); e50 = _ema(c, 50); e200 = _ema(c, 200)
     e12 = _ema(c, 12); e26 = _ema(c, 26)
     macd = [(e12[j]-e26[j]) if (e12[j] is not None and e26[j] is not None) else None for j in range(len(c))]
@@ -7803,27 +7803,36 @@ def _sweep_entries(sym, market, H):
         atr = _atr_at(hi, lo, c, i) or price * 0.02
         win = min(len(c), i+1+H)
         entries.append({"dr": dr, "price": price, "atr": atr,
-                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win]})
+                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win], "fopen": op[i+1:win]})
         i += H + 1   # non-overlapping, worst-case spacing
     return entries
 
 def _simulate(entries, tgt_m, stp_m, trail_m):
-    """Simulate one profile over pre-extracted entries. trail_m>0 = ATR trailing stop."""
+    """Simulate one profile over pre-extracted entries. trail_m>0 = ATR trailing stop.
+    HONEST engine: (a) when a bar's range touches BOTH target and stop, book the STOP
+    (conservative — real intrabar path is unknown); (b) model GAPS — if the bar OPENS
+    beyond the stop/target, fill at the open, not the level (real stops gap through)."""
     pnls = []
     for e in entries:
         dr, price, atr = e["dr"], e["price"], e["atr"]
+        fopen = e.get("fopen") or []
         tgt = price + dr*tgt_m*atr; stp = price - dr*stp_m*atr
         best = price; outp = None
         for k in range(len(e["fc"])):
             hh, ll = e["fhi"][k], e["flo"][k]
+            oo = fopen[k] if k < len(fopen) else None
             if dr > 0:
                 if trail_m > 0: best = max(best, hh); stp = max(stp, best - trail_m*atr)
+                if oo is not None and oo <= stp: outp = oo; break        # gap-down through stop → fill at open (worse)
+                if ll <= stp: outp = stp; break                          # stop checked BEFORE target (conservative)
+                if oo is not None and oo >= tgt: outp = oo; break        # gap-up through target → fill at open (better)
                 if hh >= tgt: outp = tgt; break
-                if ll <= stp: outp = stp; break
             else:
                 if trail_m > 0: best = min(best, ll); stp = min(stp, best + trail_m*atr)
-                if ll <= tgt: outp = tgt; break
+                if oo is not None and oo >= stp: outp = oo; break
                 if hh >= stp: outp = stp; break
+                if oo is not None and oo <= tgt: outp = oo; break
+                if ll <= tgt: outp = tgt; break
         if outp is None:
             outp = e["fc"][-1] if e["fc"] else price
         if outp is None or price in (None, 0):
@@ -7886,7 +7895,7 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, vol
     h = _yf_ticker(sym).history(period="2y", interval="1d")
     if len(h) < 220:
         return []
-    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
+    c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"]); op = list(h["Open"])
     dates = [str(d)[:10] for d in h.index]
     e200 = _ema(c, 200); e50 = _ema(c, 50); r2 = _rsi_series(c, 2)
     entries = []; i = 205
@@ -7910,7 +7919,7 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, vol
         atr = _atr_at(hi, lo, c, i) or price * 0.02
         win = min(len(c), i+1+H)
         entries.append({"dr": dr, "price": price, "atr": atr, "date": dates[i],
-                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win]})
+                        "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win], "fopen": op[i+1:win]})
         i += max(3, H // 3) + 1   # space entries so the same swing isn't re-counted
     return entries
 
