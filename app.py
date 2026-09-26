@@ -1600,6 +1600,53 @@ CORS(app, resources={
     }
 })
 
+# ── SECURITY: lightweight per-IP rate limiting on abusable / write / heavy endpoints ──
+# Protects the free tier from scraping, spam and cost-runaway. High-frequency read
+# endpoints (prices, signals) are intentionally NOT limited so normal use is unaffected.
+import time as _time_rl
+from collections import defaultdict as _dd
+_RL_HITS = _dd(list)
+_RL_RULES = {              # path-prefix : (max_requests, window_seconds)
+    "/profile":         (10, 60),
+    "/telegram/claim":  (12, 60),
+    "/telegram/unsubscribe": (10, 60),
+    "/param-sweep":     (6, 60),
+    "/meanrev-sweep":   (6, 60),
+    "/meanrev-oos":     (6, 60),
+    "/strategy-backtest": (6, 60),
+}
+@app.before_request
+def _rate_limit():
+    try:
+        path = request.path or ""
+        rule = next(((m, w) for p, (m, w) in _RL_RULES.items() if path.startswith(p)), None)
+        if not rule:
+            return None
+        if request.method == "OPTIONS":
+            return None
+        mx, win = rule
+        ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0]).strip()
+        now = _time_rl.time()
+        key = ip + "|" + path
+        hits = [t for t in _RL_HITS[key] if now - t < win]
+        if len(hits) >= mx:
+            return jsonify({"error": "rate limit exceeded — slow down"}), 429
+        hits.append(now); _RL_HITS[key] = hits
+        if len(_RL_HITS) > 5000:                       # cap memory
+            for k in list(_RL_HITS.keys())[:1000]: _RL_HITS.pop(k, None)
+    except Exception:
+        return None
+
+@app.after_request
+def _security_headers(resp):
+    try:
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    except Exception:
+        pass
+    return resp
+
 # Global application state - CRITICAL FOR SIGNALS
 class TradingBotState:
     def __init__(self):
