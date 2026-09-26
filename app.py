@@ -1665,7 +1665,7 @@ class TradingBotState:
 bot_state = TradingBotState()
 
 # Configuration
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8130024944:AAHPp7S8RqjTWWF3O71SvlByu6XVkeBdPUk')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or os.environ.get('TELEGRAM_TOKEN', '')  # env-only; no secret in source
 TELEGRAM_USER_ID = os.environ.get('TELEGRAM_USER_ID', '5702457196')
 
 # Symbol lists
@@ -6252,7 +6252,7 @@ def zerodha_disconnect():
 #  Nothing needs to be open on any phone/computer. Trigger /cron/scan from a
 #  free scheduler (cron-job.org) every ~15 min, or rely on the background loop.
 # ═══════════════════════════════════════════════════════════════════════════
-TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8130024944:AAGwJN20vp5CryTsdUhiXw6wuA-hZ3m0Fig")
+TG_TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN", "")  # env-only; no secret in source
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "6955435826")
 _ALERTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v3k_alerts.json")
 _notified_signals = set()
@@ -6304,6 +6304,14 @@ def telegram_claim():
     _tg_subs_save(subs)
     _tg_send("✅ You're connected to V3K signals! You'll now receive high-confidence trade alerts here. Reply STOP in the app to unsubscribe.", chat_id)
     return jsonify({"ok": True, "name": name.strip()}), 200
+
+@app.route("/telegram/selftest", methods=["GET"])
+def telegram_selftest():
+    """Confirm the bot token env var is set (no secret exposed). Optionally send a test ping."""
+    ok = bool(TG_TOKEN)
+    if ok and request.args.get("ping") == "1":
+        _tg_send("✅ V3K self-test: Telegram token active and sending.")
+    return jsonify({"token_configured": ok, "token_len": len(TG_TOKEN or "")}), 200
 
 @app.route("/telegram/status", methods=["GET"])
 def telegram_status():
