@@ -7988,7 +7988,7 @@ def meanrev_list():
         opent = []
     return jsonify({"strategy": "Dip-Buy (mean-reversion, RSI2<5 in uptrend)", "market": market,
                     "setups": live, "open_trades": len(opent),
-                    "note": "Backtested PF ~1.05 (2y). Analytics, not advice."}), 200
+                    "note": "Analytics only — this strategy did NOT hold out-of-sample (no validated edge). Paper-test first. Not advice."}), 200
 
 @app.route("/meanrev-sweep", methods=["GET"])
 def meanrev_sweep():
