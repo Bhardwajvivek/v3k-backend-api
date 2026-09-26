@@ -7933,24 +7933,36 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, vol
 # Long-only dip-buy: in an uptrend (price > 200-EMA) buy a deep oversold dip (RSI2 < 5).
 # Profile: 1.5 ATR target / 1.0 ATR stop / 2.0 ATR trailing. Long-only = retail-safe (no shorting).
 _MR_RSI_LO = 5.0
+# #7 liquidity floor: min average daily traded value (price×20d-avg-volume) in the stock's
+# own currency (~₹2cr / ~$20M). Nifty-50 & US large-caps clear it easily; it blocks thin names.
+_MIN_ADV_VALUE = 20_000_000
 def _meanrev_signal(sym):
     """Return a live dip-buy setup dict for sym, or None. Checks the latest bar only."""
     try:
         h = _yf_ticker(sym).history(period="1y", interval="1d")
         if len(h) < 210:
             return None
-        c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"])
+        c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
         e200 = _ema(c, 200); r2 = _rsi_series(c, 2)
         i = len(c) - 1
         price = c[i]; rv = r2[i]; trend = e200[i]
         if rv is None or trend is None or not (price > trend and rv < _MR_RSI_LO):
             return None
+        # #7 LIQUIDITY GATE — skip thin names you can't realistically fill. Require avg
+        # daily traded value (20d) above a floor so signals are actually tradable.
+        adv = _sma_at(vol, 20, i)
+        adv_val = (adv * price) if adv else 0
+        if adv_val < _MIN_ADV_VALUE:
+            return None
         atr = _atr_at(hi, lo, c, i) or price * 0.02
-        # feature vector for ML logging (kept parallel to swing features where possible)
         feat = {"rsi2": round(rv, 1), "atr_pct": round(atr / price * 100, 2),
                 "above200_pct": round((price / trend - 1) * 100, 2)}
+        # #7 LIMIT-ENTRY BAND — don't chase; enter only in a tight zone around the signal price.
+        band = max(price * 0.003, 0.25 * atr)
         return {"sym": sym, "type": "BUY", "score": 6, "price": round(price, 2),
-                "atr": atr, "trend_ok": True, "feat": feat, "rsi2": round(rv, 1)}
+                "atr": atr, "trend_ok": True, "feat": feat, "rsi2": round(rv, 1),
+                "entry_lo": round(price - band, 2), "entry_hi": round(price + band, 2),
+                "adv_val": int(adv_val)}
     except Exception:
         return None
 
@@ -7979,12 +7991,14 @@ def _open_meanrev_trade(r, market, trades, opened_msgs):
     entry = r["price"]; atr = r["atr"]; clean = r["sym"].replace(".NS", "")
     tm, sm, trail = 1.5, 1.0, 2.0
     t1 = round(entry + tm * atr, 2); sl = round(entry - sm * atr, 2)
+    elo, ehi = r.get("entry_lo", entry), r.get("entry_hi", entry)
     trades.append({"sym": r["sym"], "market": market, "kind": "meanrev", "side": "buy",
                    "entry": entry, "t1": t1, "sl": sl, "status": "open", "conf": conf,
+                   "entry_lo": elo, "entry_hi": ehi,
                    "atr": round(atr, 4), "trail": trail, "peak": entry,
                    "feat": r.get("feat"), "opened_at": time_module.time()})
-    msg = "🎯 Dip-Buy (mean-reversion) BUY %s @ %s · 🎯 %s · 🛑 %s\n✅ Confidence %d%% · 📉 RSI2 %.1f oversold in uptrend (backtested edge)" % (
-        clean, entry, t1, sl, conf, r.get("rsi2", 0))
+    msg = "🎯 Dip-Buy (mean-reversion) BUY %s\n📥 Entry zone %s–%s (don't chase above) · 🎯 %s · 🛑 %s\n✅ Confidence %d%% · 📉 RSI2 %.1f oversold in uptrend" % (
+        clean, elo, ehi, t1, sl, conf, r.get("rsi2", 0))
     if market == "india":
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
     opened_msgs.append(msg)
@@ -8064,7 +8078,9 @@ def meanrev_list():
             if conf < _CONF_GATE:      # quality gate — only show what we'd actually alert
                 continue
             live.append({"sym": sym.replace(".NS", ""), "price": entry, "rsi2": s["rsi2"], "conf": conf,
-                         "t1": round(entry + 1.5*atr, 2), "sl": round(entry - 1.0*atr, 2)})
+                         "t1": round(entry + 1.5*atr, 2), "sl": round(entry - 1.0*atr, 2),
+                         "entry_lo": s.get("entry_lo", entry), "entry_hi": s.get("entry_hi", entry),
+                         "adv_val": s.get("adv_val", 0)})
     live.sort(key=lambda x: -x["conf"])
     try:
         opent = [t for t in (_swings_load() or []) if t.get("status") == "open" and t.get("kind") == "meanrev"]
