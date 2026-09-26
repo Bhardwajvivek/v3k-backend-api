@@ -7832,6 +7832,7 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, vol
     if len(h) < 220:
         return []
     c = list(h["Close"]); hi = list(h["High"]); lo = list(h["Low"]); vol = list(h["Volume"])
+    dates = [str(d)[:10] for d in h.index]
     e200 = _ema(c, 200); e50 = _ema(c, 50); r2 = _rsi_series(c, 2)
     entries = []; i = 205
     while i < len(c) - 1:
@@ -7853,7 +7854,7 @@ def _meanrev_entries(sym, market, H, rsi_lo=10.0, rsi_hi=90.0, strict=False, vol
             i += 1; continue
         atr = _atr_at(hi, lo, c, i) or price * 0.02
         win = min(len(c), i+1+H)
-        entries.append({"dr": dr, "price": price, "atr": atr,
+        entries.append({"dr": dr, "price": price, "atr": atr, "date": dates[i],
                         "fhi": hi[i+1:win], "flo": lo[i+1:win], "fc": c[i+1:win]})
         i += max(3, H // 3) + 1   # space entries so the same swing isn't re-counted
     return entries
@@ -8023,6 +8024,64 @@ def meanrev_sweep():
            "top": grid[:8],
            "note": "2y backtest, 0.15%/trade cost. profit_factor>1 = net-profitable. Not a guarantee of future results."}
     _MR_CACHE[ck] = (now, res)
+    return jsonify(res)
+
+_OOS_CACHE = {}
+@app.route("/meanrev-oos", methods=["GET"])
+def meanrev_oos():
+    """OUT-OF-SAMPLE VALIDATION — the real test for curve-fitting. Splits history in two:
+    optimise the profile on the FIRST ~55% (in-sample), then apply that EXACT profile to the
+    unseen LAST ~45% (out-of-sample). If OOS stays profitable, the edge is genuine; if it
+    collapses, the backtest was overfit. ?market=&n=&h=&lo="""
+    market = "us" if request.args.get("market") == "us" else "india"
+    nsy = min(50, max(10, int(request.args.get("n", 40))))
+    H   = min(30, max(3, int(request.args.get("h", 10))))
+    lo  = float(request.args.get("lo", 5))
+    ck = "%s:%d:%d:%.0f" % (market, nsy, H, lo); now = time_module.time()
+    c0 = _OOS_CACHE.get(ck)
+    if c0 and now - c0[0] < _BT_TTL:
+        return jsonify(c0[1])
+    syms = (_WATCH_US if market == "us" else _WATCH_IN)[:nsy]
+    alle = []
+    for sym in syms:
+        try: alle += _meanrev_entries(sym, market, H, lo, 100 - lo)
+        except Exception: pass
+    alle = [e for e in alle if e.get("date")]
+    alle.sort(key=lambda e: e["date"])
+    if len(alle) < 40:
+        return jsonify({"error": "not enough entries for a split (need 40+, got %d)" % len(alle)}), 200
+    cut = int(len(alle) * 0.55)
+    ins, oos = alle[:cut], alle[cut:]
+    # 1) optimise profile on IN-SAMPLE only
+    best = None
+    for tgt in (0.5, 0.75, 1.0, 1.5, 2.0):
+        for stp in (1.0, 1.5, 2.0, 3.0):
+            for trail in (0, 2.0, 3.0):
+                r = _simulate(ins, tgt, stp, trail)
+                if r and r["trades"] >= 15 and (best is None or (r.get("profit_factor") or 0) > (best.get("profit_factor") or 0)):
+                    best = {**r, "tgt": tgt, "stp": stp, "trail": trail}
+    if not best:
+        return jsonify({"error": "no viable in-sample profile"}), 200
+    # 2) apply that SAME profile to the unseen OUT-OF-SAMPLE data
+    oos_r = _simulate(oos, best["tgt"], best["stp"], best["trail"]) or {}
+    ins_pf = best.get("profit_factor") or 0
+    oos_pf = oos_r.get("profit_factor") or 0
+    if oos_pf >= 1.0 and oos_pf >= ins_pf * 0.6:
+        verdict = "ROBUST — the edge holds on unseen data. Not just curve-fitting."
+    elif oos_pf >= 0.95:
+        verdict = "MARGINAL — barely holds out-of-sample; treat the edge as fragile."
+    else:
+        verdict = "OVERFIT — the edge collapses on unseen data. The backtest was optimistic."
+    res = {"strategy": "RSI2<%g mean-reversion, in/out-of-sample" % lo, "market": market,
+           "entries_total": len(alle), "split_date": oos[0]["date"],
+           "in_sample": {"n": best["trades"], "profit_factor": ins_pf, "win_rate": best.get("win_rate"),
+                         "expectancy_pct": best.get("expectancy_pct"),
+                         "profile": "tgt %.2f / stop %.2f / trail %.1f" % (best["tgt"], best["stp"], best["trail"])},
+           "out_of_sample": {"n": oos_r.get("trades"), "profit_factor": oos_pf, "win_rate": oos_r.get("win_rate"),
+                             "expectancy_pct": oos_r.get("expectancy_pct")},
+           "verdict": verdict,
+           "note": "Profile chosen ONLY on in-sample, then applied unchanged to out-of-sample. This is the honest test for overfitting."}
+    _OOS_CACHE[ck] = (now, res)
     return jsonify(res)
 
 @app.route("/strategy-backtest", methods=["GET"])
