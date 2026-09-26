@@ -1609,6 +1609,9 @@ _RL_HITS = _dd(list)
 _RL_RULES = {              # path-prefix : (max_requests, window_seconds)
     "/profile":         (10, 60),
     "/signals/pause":   (20, 60),
+    "/auth/login":      (8, 300),      # brute-force protection
+    "/auth/signup":     (5, 300),
+    "/auth/grant":      (10, 60),
     "/telegram/claim":  (12, 60),
     "/telegram/unsubscribe": (10, 60),
     "/param-sweep":     (6, 60),
@@ -8003,14 +8006,95 @@ def _open_meanrev_trade(r, market, trades, opened_msgs):
         msg += "\n▶ Place in Zerodha (1-tap, you confirm): https://v3k-frontend-clean.vercel.app/#order=%s:BUY" % clean
     opened_msgs.append(msg)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  REAL SERVER-SIDE AUTH — hashed passwords + signed JWTs (stored in Upstash, free).
+#  Pro/Owner status now comes from a SERVER-SIGNED token that cannot be forged by
+#  editing localStorage. Passwords are hashed server-side (PBKDF2 via werkzeug).
+# ══════════════════════════════════════════════════════════════════════════════
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt as _jwt
+_AUTH_SECRET = os.environ.get("SECRET_KEY", "v3k-ai-trading-bot-secret-key-2025")
+_OWNER_EMAIL = "bhardwajvivek.v3@gmail.com"
+
+def _auth_users(): return _kv_get("v3k_auth_users", {}) or {}
+def _auth_save(u): _kv_set("v3k_auth_users", u)
+def _plan_for(email):
+    email = (email or "").strip().lower()
+    if email == _OWNER_EMAIL: return "owner"
+    return (_auth_users().get(email, {}) or {}).get("plan", "free")
+def _make_token(email, plan):
+    from datetime import timedelta
+    return _jwt.encode({"email": email, "plan": plan, "exp": datetime.utcnow() + timedelta(days=30)},
+                       _AUTH_SECRET, algorithm="HS256")
+def _decode_token(tok):
+    try: return _jwt.decode(tok, _AUTH_SECRET, algorithms=["HS256"])
+    except Exception: return None
+def _bearer():
+    h = request.headers.get("Authorization", "") or ""
+    return h[7:].strip() if h.startswith("Bearer ") else ""
+def _auth_email():
+    """Verified email from the request's JWT, or '' if none/invalid."""
+    p = _decode_token(_bearer())
+    return (p.get("email", "") if p else "").strip().lower()
+def _is_owner_req():
+    return _auth_email() == _OWNER_EMAIL
+
+@app.route("/auth/signup", methods=["POST"])
+def auth_signup():
+    d = request.json or {}
+    email = (d.get("email", "") or "").strip().lower(); pw = d.get("password", "") or ""
+    if "@" not in email or "." not in email or len(pw) < 6:
+        return jsonify({"error": "Enter a valid email and a password of 6+ characters."}), 400
+    users = _auth_users()
+    if email in users and email != _OWNER_EMAIL:
+        return jsonify({"error": "An account with this email exists — please log in."}), 409
+    plan = "owner" if email == _OWNER_EMAIL else "free"
+    users[email] = {"pw": generate_password_hash(pw), "plan": plan, "created": time_module.time()}
+    _auth_save(users)
+    return jsonify({"ok": True, "token": _make_token(email, plan), "email": email, "plan": plan}), 200
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    d = request.json or {}
+    email = (d.get("email", "") or "").strip().lower(); pw = d.get("password", "") or ""
+    users = _auth_users(); u = users.get(email)
+    if not u and email == _OWNER_EMAIL:            # owner auto-registers on first login, any device
+        users[email] = {"pw": generate_password_hash(pw), "plan": "owner", "created": time_module.time()}
+        _auth_save(users); u = users[email]
+    if not u or not check_password_hash(u.get("pw", ""), pw):
+        return jsonify({"error": "Wrong email or password."}), 401
+    plan = _plan_for(email)
+    return jsonify({"ok": True, "token": _make_token(email, plan), "email": email, "plan": plan}), 200
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    p = _decode_token(_bearer())
+    if not p: return jsonify({"error": "unauthenticated"}), 401
+    email = (p.get("email", "") or "").strip().lower(); plan = _plan_for(email)
+    return jsonify({"email": email, "plan": plan, "is_owner": plan == "owner", "is_pro": plan in ("pro", "owner")}), 200
+
+@app.route("/auth/grant", methods=["POST"])
+def auth_grant():
+    """Owner grants/revokes Pro for a user (requires a valid owner JWT)."""
+    if not _is_owner_req():
+        return jsonify({"error": "owner only"}), 403
+    d = request.json or {}
+    target = (d.get("email", "") or "").strip().lower(); plan = d.get("plan", "pro")
+    if plan not in ("free", "pro"): plan = "pro"
+    users = _auth_users()
+    if target not in users:
+        return jsonify({"error": "user not found"}), 404
+    users[target]["plan"] = plan; _auth_save(users)
+    return jsonify({"ok": True, "email": target, "plan": plan}), 200
+
 @app.route("/profile", methods=["GET", "POST"])
 def profile():
     """Owner profile / contact card, synced across all devices & users via Upstash.
-    GET returns the public profile; POST (owner-only) saves it."""
+    GET returns the public profile; POST requires a valid OWNER JWT (no forgeable email gate)."""
     OWNER = "bhardwajvivek.v3@gmail.com"
     if request.method == "POST":
         data = request.json or {}
-        if (data.get("owner_email", "") or "").strip().lower() != OWNER:
+        if not _is_owner_req():                    # real JWT owner check (was a forgeable email)
             return jsonify({"error": "not authorised"}), 403
         prof = {k: (data.get(k, "") or "") for k in ("brand", "name", "role", "email", "phone", "tagline", "photo")}
         # If phone left blank on edit (client never sees the full number), keep the existing one.
@@ -8034,10 +8118,9 @@ def signals_pause():
     """KILL SWITCH. GET → current state. POST {owner_email, paused:true|false} → set it.
     When paused, the 24/7 engine opens no new trades and sends no new-entry alerts
     (open trades are still monitored for exits). Owner-only."""
-    OWNER = "bhardwajvivek.v3@gmail.com"
     if request.method == "POST":
         data = request.json or {}
-        if (data.get("owner_email", "") or "").strip().lower() != OWNER:
+        if not _is_owner_req():                    # real JWT owner check (was a forgeable email)
             return jsonify({"error": "not authorised"}), 403
         _kv_set("v3k_signals_paused", bool(data.get("paused")))
         return jsonify({"ok": True, "paused": bool(data.get("paused"))}), 200
