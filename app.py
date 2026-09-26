@@ -1608,6 +1608,7 @@ from collections import defaultdict as _dd
 _RL_HITS = _dd(list)
 _RL_RULES = {              # path-prefix : (max_requests, window_seconds)
     "/profile":         (10, 60),
+    "/signals/pause":   (20, 60),
     "/telegram/claim":  (12, 60),
     "/telegram/unsubscribe": (10, 60),
     "/param-sweep":     (6, 60),
@@ -7258,26 +7259,31 @@ def _run_scan():
     _STRAT_STATS = _strategy_stats()
     _scan_alerts = 0
 
-    # 1) SWING scan (daily) — a new strong signal opens ONE swing trade.
-    # The single alert per stock comes from _open_or_check_trade (deduped by the
-    # persisted trades file, so it survives restarts and never re-sends).
-    for sym in syms:
-        try:
-            r = _signal_tf(sym, "1y", "1d")
-            if r:
-                _open_or_check_trade(r, market, "swing", trades, opened_msgs, closed_msgs)
-        except Exception:
-            pass
+    # KILL SWITCH: when paused, we still MONITOR open trades for exits (below) but open
+    # NO new trades and send NO new-entry alerts. Owner toggles via /signals/pause.
+    _paused = False
+    try: _paused = bool(_kv_get("v3k_signals_paused", False))
+    except Exception: _paused = False
 
-    # 1b) DIP-BUY scan (mean-reversion) — the one backtested-profitable edge (PF ~1.05).
-    # Buys deep oversold dips (RSI2 < 5) inside an uptrend; monitored/trailed like swings.
-    for sym in syms:
-        try:
-            mr = _meanrev_signal(sym)
-            if mr:
-                _open_meanrev_trade(mr, market, trades, opened_msgs)
-        except Exception:
-            pass
+    # 1) SWING scan (daily) — a new strong signal opens ONE swing trade.
+    if not _paused:
+        for sym in syms:
+            try:
+                r = _signal_tf(sym, "1y", "1d")
+                if r:
+                    _open_or_check_trade(r, market, "swing", trades, opened_msgs, closed_msgs)
+            except Exception:
+                pass
+
+    # 1b) DIP-BUY scan (mean-reversion). Buys deep oversold dips (RSI2 < 5) in an uptrend.
+    if not _paused:
+        for sym in syms:
+            try:
+                mr = _meanrev_signal(sym)
+                if mr:
+                    _open_meanrev_trade(mr, market, trades, opened_msgs)
+            except Exception:
+                pass
 
     # 2) INTRADAY scan — DISABLED. The 2y backtest showed intraday setups hit the stop-loss
     #    far too often; V3K now trades SWING / POSITIONAL only (multi-day holds).
@@ -8008,6 +8014,20 @@ def profile():
     ph = "".join(ch for ch in str(prof.get("phone", "")) if ch.isdigit())
     prof["phone"] = ("•" * max(4, len(ph) - 4) + ph[-4:]) if len(ph) >= 4 else ""
     return jsonify(prof), 200
+
+@app.route("/signals/pause", methods=["GET", "POST"])
+def signals_pause():
+    """KILL SWITCH. GET → current state. POST {owner_email, paused:true|false} → set it.
+    When paused, the 24/7 engine opens no new trades and sends no new-entry alerts
+    (open trades are still monitored for exits). Owner-only."""
+    OWNER = "bhardwajvivek.v3@gmail.com"
+    if request.method == "POST":
+        data = request.json or {}
+        if (data.get("owner_email", "") or "").strip().lower() != OWNER:
+            return jsonify({"error": "not authorised"}), 403
+        _kv_set("v3k_signals_paused", bool(data.get("paused")))
+        return jsonify({"ok": True, "paused": bool(data.get("paused"))}), 200
+    return jsonify({"paused": bool(_kv_get("v3k_signals_paused", False))}), 200
 
 @app.route("/ensemble", methods=["GET"])
 def ensemble():
